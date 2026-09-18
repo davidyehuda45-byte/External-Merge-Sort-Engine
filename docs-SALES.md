@@ -1,25 +1,177 @@
 # Sales Kit — External Merge Sort Engine
 
-## 30-second pitch
-"Sort file yang lebih besar dari RAM. 2GB di laptop 8GB, 1TB di server. CSV per kolom, resume kalau mati lampu, dashboard live, output JSON buat CI. Ada GUI buat staf non-teknis."
+## 30-Second Pitch
 
-## Demo script (5 menit, bikin klien ngangguk)
-1. `Start-GUI.bat` → Generate demo 10k → Urutkan sekarang → Download (30 detik, tanpa CLI).
-2. CLI power: `--dry-run` dulu (estimasi gratis), lalu sort 200k rows + `--verify` + `--json`.
-3. Matikan paksa (Ctrl-C) di tengah jalan → `--resume list` → `--resume` → "tidak ada kerja yang hilang".
-4. Tunjukkan `--reverse --unique --header --limit 1000` (Top-N) — fitur yang GNU sort pun ribet untuk file raksasa.
-5. Tutup: "audit tiap run ke `--log-file audit.jsonl`."
+> **"Sort files that are larger than your available RAM. Handle 2GB files on an 8GB laptop, and 1TB+ files on servers. Sort CSV files by column, resume interrupted jobs, monitor progress with a live dashboard, and export JSON for CI. There is also a simple GUI for non-technical staff."**
 
-## Pricing suggestion (custom dev model — jasa)
-- Personal/Tim: custom build sesuai kebutuhan
-- Enterprise: SLA + custom (S3, gzip, GUI branding, installer MSI)
+---
 
-## Objection handling
-- "Kenapa tidak pakai GNU sort?" → GNU sort tidak punya resume, dashboard, JSON, Top-N streaming, pre-flight disk check, dan makan RAM tak terbatas.
-- "Kenapa tidak Python pandas?" → pandas butuh RAM > file. Ini bounded `--max-memory`.
-- "Data sensitif?" → 100% offline, single binary, temp dibersihkan otomatis, atomic output (tidak pernah setengah-jadi).
+## 5-Minute Demo
 
-## What's inside
-- Formats: numeric binary u64, string, CSV multi-key (s/d 4 kolom), JSONL, Excel, header, reverse, unique, limit.
-- Safety: exit codes 0-6, pre-flight disk, `.part` + rename, `--verify` order + row-count.
-- Ops: `--gui`, `--api`, `--watch`, `--dashboard`, `--json`, `--log-file`, `--temp-dir`, `--resume`, `--merge`, `--split-by`, Docker.
+### 1. Start with the GUI
+
+Run:
+
+```text
+Start-GUI.bat
+```
+
+Then:
+
+```text
+Generate demo 10k
+→ Sort Now
+→ Download
+```
+
+No command line required.
+
+### 2. Show the Developer Workflow
+
+Run `--dry-run` first to get a free estimate.
+
+Then sort 200k rows using:
+
+```text
+--verify --json
+```
+
+Show the processing information and verification result.
+
+### 3. Test Crash Recovery
+
+Stop the process with `Ctrl-C` while it is running.
+
+Then run:
+
+```text
+--resume list
+```
+
+and:
+
+```text
+--resume
+```
+
+The engine continues from the completed work instead of starting everything from the beginning.
+
+### 4. Show Advanced Sorting
+
+Demonstrate:
+
+```text
+--reverse --unique --header --limit 1000
+```
+
+This can sort in reverse order, remove duplicates, preserve headers, and return only the first 1,000 results.
+
+### 5. Finish with the Audit Log
+
+Every run can be recorded using:
+
+```text
+--log-file audit.jsonl
+```
+
+This gives you a machine-readable history of sorting jobs.
+
+---
+
+# Pricing
+
+The engine is offered using a **custom development/service model**.
+
+### Personal / Team
+
+Custom builds based on your requirements.
+
+### Enterprise
+
+Custom solutions can include:
+
+* SLA
+* S3 integration
+* Gzip support
+* Custom GUI branding
+* MSI installer
+* Other enterprise-specific requirements
+
+---
+
+# Common Questions
+
+### "Why not just use GNU sort?"
+
+GNU `sort` is a powerful tool, but this engine adds features designed for larger and more controlled workflows, including:
+
+* Resume support
+* Live dashboard
+* JSON output
+* Top-N processing
+* Pre-flight disk-space checks
+* Controlled memory usage
+
+### "Why not use Python pandas?"
+
+For datasets larger than available RAM, pandas may require significant memory.
+
+External Merge Sort Engine uses a configurable memory limit:
+
+```text
+--max-memory
+```
+
+This allows the sorting process to operate within a defined memory budget.
+
+### "What about sensitive data?"
+
+The engine is designed to run **100% offline**.
+
+* Data stays on your machine or server.
+* Distributed as a single binary.
+* Temporary files are cleaned up automatically.
+* Output is written safely using `.part` files and atomic rename.
+* `--verify` can check the final result.
+
+No cloud upload is required.
+
+---
+
+# What's Included
+
+## Data Formats
+
+* Binary numeric `u64`
+* String
+* CSV
+* CSV multi-key sorting, up to 4 columns
+* JSONL
+* Excel
+* Header support
+* Reverse sorting
+* Duplicate removal
+* Top-N results
+
+## Safety
+
+* Exit codes `0-6`
+* Pre-flight disk-space checks
+* `.part` temporary output + atomic rename
+* `--verify`
+* Order verification
+* Row-count verification
+
+## Operations
+
+* `--gui`
+* `--api`
+* `--watch`
+* `--dashboard`
+* `--json`
+* `--log-file`
+* `--temp-dir`
+* `--resume`
+* `--merge`
+* `--split-by`
+* Docker support
