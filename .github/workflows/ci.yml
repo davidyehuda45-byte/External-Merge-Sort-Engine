@@ -1,0 +1,14 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  build-test:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cargo test --test correctness -- --skip prop
+      - run: cargo test --test output_modes -- json_summary_is_well_formed quiet_mode_prints_summary_only gen_bin_smoke

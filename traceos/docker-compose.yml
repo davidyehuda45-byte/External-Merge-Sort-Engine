@@ -1,0 +1,230 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: traceos
+      POSTGRES_USER: traceos
+      POSTGRES_PASSWORD: traceos_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U traceos -d traceos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.106.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./infrastructure/otel/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"  # OTLP gRPC
+      - "4318:4318"  # OTLP HTTP
+      - "8888:8888"  # Prometheus metrics
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://traceos:traceos_dev@postgres:5432/traceos
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-change-in-production
+      API_KEY: traceos-dev-key
+      ENVIRONMENT: development
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./apps/api:/app/apps/api:ro
+      - ./services:/app/services:ro
+      - ./packages:/app/packages:ro
+
+  worker-ingestion:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.worker
+    command: python -m services.ingestion.worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://traceos:traceos_dev@postgres:5432/traceos
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+
+  worker-correlation:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.worker
+    command: python -m services.correlation.worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://traceos:traceos_dev@postgres:5432/traceos
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-anomaly:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.worker
+    command: python -m services.anomaly.worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://traceos:traceos_dev@postgres:5432/traceos
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-incidents:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.worker
+    command: python -m services.incidents.worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://traceos:traceos_dev@postgres:5432/traceos
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-rootcause:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.worker
+    command: python -m services.rootcause.worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://traceos:traceos_dev@postgres:5432/traceos
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://localhost:8000
+    depends_on:
+      - api
+    volumes:
+      - ./apps/dashboard:/app/apps/dashboard:ro
+      - ./packages:/app/packages:ro
+
+  # Demo services
+  gateway:
+    build:
+      context: ./demo/gateway
+      dockerfile: Dockerfile
+    environment:
+      TRACEOS_API_URL: http://api:8000
+      TRACEOS_API_KEY: traceos-dev-key
+      SERVICE_NAME: gateway
+    depends_on:
+      - api
+      - auth-service
+      - order-service
+      - payment-service
+    ports:
+      - "8080:8080"
+
+  auth-service:
+    build:
+      context: ./demo/auth-service
+      dockerfile: Dockerfile
+    environment:
+      TRACEOS_API_URL: http://api:8000
+      TRACEOS_API_KEY: traceos-dev-key
+      SERVICE_NAME: auth-service
+    depends_on:
+      - api
+    ports:
+      - "8081:8081"
+
+  order-service:
+    build:
+      context: ./demo/order-service
+      dockerfile: Dockerfile
+    environment:
+      TRACEOS_API_URL: http://api:8000
+      TRACEOS_API_KEY: traceos-dev-key
+      SERVICE_NAME: order-service
+    depends_on:
+      - api
+      - payment-service
+    ports:
+      - "8082:8082"
+
+  payment-service:
+    build:
+      context: ./demo/payment-service
+      dockerfile: Dockerfile
+    environment:
+      TRACEOS_API_URL: http://api:8000
+      TRACEOS_API_KEY: traceos-dev-key
+      SERVICE_NAME: payment-service
+    depends_on:
+      - api
+    ports:
+      - "8083:8083"
+
+  incident-simulator:
+    build:
+      context: ./demo/incident-simulator
+      dockerfile: Dockerfile
+    environment:
+      TRACEOS_API_URL: http://api:8000
+      TRACEOS_API_KEY: traceos-dev-key
+      GATEWAY_URL: http://gateway:8080
+    depends_on:
+      - api
+      - gateway
+    profiles:
+      - demo
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    name: traceos-network

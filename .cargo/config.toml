@@ -1,0 +1,10 @@
+# Statically link the MSVC C runtime so the shipped .exe needs no
+# Visual C++ Redistributable on the customer's machine (matches the
+# "Single binary. No runtime." claim in README.md). Without this,
+# mergesort.exe dynamically depends on VCRUNTIME140.dll, which is not
+# guaranteed present on a clean Windows install.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
