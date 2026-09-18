@@ -1,164 +1,769 @@
 # External Merge Sort Engine
 
-Sort files **larger than RAM** with bounded memory. Numeric (binary u64), string, and CSV/multi-key. Crash-resume, live dashboard, JSON output for CI. **Web GUI for non-technical staff, Top-N + audit log.**
+> Sort very large files without needing a huge amount of RAM.
 
-Built in Rust. Single binary. No runtime. Windows / Linux / macOS. 100% offline.
+External Merge Sort Engine is a fast, offline file-sorting tool built with Rust. It can sort files that are much larger than your computer's available memory.
 
-## Why buy this?
+It supports **numeric data, text, CSV, JSONL, and Excel files**, with both a command-line interface and a web-based GUI for non-technical users.
 
-- Handles 2GB → 1TB+ files on an 8GB laptop (`--max-memory 512MB`)
-- CSV sort by column: `--format csv --key-column 2 --key-type numeric`
-- Production safety: pre-flight disk check, atomic output (`.part` + rename), `--verify`, exit codes 0-6
-- Crash resume: `--resume list` / `--resume` (never redo completed chunks)
-- Observability: progress bars, `--json` for scripts, `--dashboard 127.0.0.1:8080` live web UI + `/metrics`
-- Commercial flags: `--reverse`, `--unique`, `--header`, `--dry-run`
+**Works on Windows, Linux, and macOS. No runtime or internet connection required.**
 
-## Quickstart (GUI — buat staf non-teknis)
+---
+
+## Why Use It?
+
+Large files can be difficult to sort because your computer may not have enough RAM.
+
+For example:
+
+* You have a **1 TB file**
+* Your laptop only has **8 GB RAM**
+* You can still sort the file using a limited memory budget such as `--max-memory 512MB`
+
+The engine splits the file into smaller parts, sorts them separately, and combines them into the final sorted file.
+
+### Key Features
+
+* **Sort huge files** — Designed for files from GBs to TBs.
+* **Low memory usage** — Set exactly how much RAM the engine can use.
+* **CSV sorting** — Sort by a specific column.
+* **Multiple sorting rules** — Sort using multiple columns.
+* **Remove duplicates** — Remove identical rows or duplicates based on a column.
+* **Top-N results** — Keep only the first N results.
+* **Preview results** — See what the result will look like before saving it.
+* **Safe file handling** — The original file is protected while sorting.
+* **Resume after interruption** — Continue an interrupted job without starting everything again.
+* **Verify results** — Check that the final file is correctly sorted.
+* **Live dashboard** — Watch the sorting process from your browser.
+* **JSON output** — Easy to integrate with scripts and CI systems.
+* **Web GUI** — Simple interface for people who do not use command-line tools.
+* **Offline** — Your data stays on your computer.
+* **Cross-platform** — Windows, Linux, and macOS.
+
+---
+
+## Quick Start: Web GUI
+
+Don't like command-line tools? Humans have invented buttons for a reason.
+
+Start the web interface:
 
 ```powershell
 .\mergesort.exe --gui 127.0.0.1:8080
-# atau double-click Start-GUI.bat dari ZIP installer
-# buka http://127.0.0.1:8080/ → Generate demo → Urutkan sekarang → Download
 ```
 
-## Quickstart (CLI)
+Or double-click:
+
+```text
+Start-GUI.bat
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8080/
+```
+
+The GUI lets non-technical users:
+
+1. Select a file
+2. Choose what to sort
+3. Preview the result
+4. Start sorting
+5. Monitor progress
+6. Download the result
+7. View previous jobs and audit logs
+
+---
+
+## Quick Start: CLI
+
+### Build
 
 ```powershell
-# build
 cargo build --release
+```
 
-# generate test data (100k rows)
+### Generate test data
+
+```powershell
 .\target\release\gen.exe data.csv 100000 csv
+```
 
-# estimate first (free, no sorting)
+This creates a CSV file containing 100,000 test rows.
+
+### Check the estimated cost first
+
+```powershell
 .\target\release\mergesort.exe --input data.csv --output sorted.csv --max-memory 512MB --format csv --key-column 0 --key-type numeric --dry-run
+```
 
-# sort CSV by column 0 (numeric), keep header, verify
+This does **not** sort the file.
+
+It estimates:
+
+* Required disk space
+* Memory usage
+* Number of chunks
+* Expected processing setup
+* Recommended configuration
+
+### Sort a CSV file
+
+```powershell
 .\target\release\mergesort.exe --input data.csv --output sorted.csv --max-memory 512MB --format csv --key-column 0 --key-type numeric --header --verify
+```
 
-# descending + dedup + Top-1000 + audit log
+### Sort text, remove duplicates, and keep only 1,000 results
+
+```powershell
 .\target\release\mergesort.exe --input data.txt --output sorted.txt --max-memory 1GB --mode string --reverse --unique --limit 1000 --verify --log-file audit.jsonl
+```
 
-# live dashboard + JSON for CI
+### Sort while monitoring the process
+
+```powershell
 .\target\release\mergesort.exe --input big.bin --output big.sorted.bin --max-memory 1GB --json --dashboard 127.0.0.1:8080 --verify
 ```
 
-## Full CLI (v2.0.1 — 20 fitur jualan)
+---
 
+# Features
+
+## Preview Before Saving
+
+Use:
+
+```text
+--preview N
 ```
---input <path> --output <path> --max-memory <size>   (required, e.g. 512MB, 2GB)
+
+See the first and last results before committing the final output.
+
+**Simple explanation:**
+
+> "See the result first."
+
+---
+
+## Check a File Before Sorting
+
+Use:
+
+```text
+--check
+```
+
+The engine checks whether the file is valid before starting the sorting process.
+
+**Simple explanation:**
+
+> "Make sure the file is ready."
+
+---
+
+## Estimate Before Running
+
+Use:
+
+```text
+--dry-run
+```
+
+The engine estimates the resources required before doing the actual work.
+
+It can detect things such as:
+
+* File format
+* CSV delimiter
+* Header
+* Encoding
+* Required disk space
+* Memory requirements
+
+**Simple explanation:**
+
+> "Know the cost before you start."
+
+---
+
+## Sort CSV Files
+
+Example:
+
+```text
+--format csv --key-column 2 --key-type numeric
+```
+
+You can sort CSV files by:
+
+* Number
+* Text
+* Date
+* Multiple columns
+
+Example:
+
+```text
+--multi-key "2,3"
+```
+
+**Simple explanation:**
+
+> "Sort your spreadsheet data the way you need."
+
+---
+
+## JSONL Support
+
+Sort JSONL files using a specific field:
+
+```text
+--format jsonl --key-field user.age --key-type numeric
+```
+
+**Simple explanation:**
+
+> "Sort structured application data."
+
+---
+
+## Remove Duplicates
+
+Remove identical rows:
+
+```text
+--unique
+```
+
+Or remove duplicates based on a specific column:
+
+```text
+--dedupe-by 2
+```
+
+**Simple explanation:**
+
+> "Clean up duplicate data."
+
+---
+
+## Top-N Results
+
+Only keep a specific number of results:
+
+```text
+--limit 1000
+```
+
+Useful when you only need the first 1,000 results instead of the entire sorted file.
+
+**Simple explanation:**
+
+> "Get only the results you need."
+
+---
+
+## Resume After a Crash
+
+If the process is interrupted, you can check available jobs:
+
+```text
+--resume list
+```
+
+Then continue the previous job:
+
+```text
+--resume
+```
+
+Completed chunks do not need to be processed again.
+
+**Simple explanation:**
+
+> "Continue where you left off."
+
+---
+
+## Verify the Result
+
+Use:
+
+```text
+--verify
+```
+
+The engine checks the final file to make sure:
+
+* Data is correctly sorted
+* The number of records is correct
+* The output can be read successfully
+
+**Simple explanation:**
+
+> "Make sure the result is correct."
+
+---
+
+## Merge Existing Sorted Files
+
+Already have multiple sorted files?
+
+Combine them without sorting everything again:
+
+```text
+--merge file1.csv file2.csv file3.csv --output monthly.csv
+```
+
+**Simple explanation:**
+
+> "Combine daily files into one larger file."
+
+---
+
+## Split Large Output
+
+Split the result into multiple files:
+
+```text
+--split-by 5
+```
+
+This creates files such as:
+
+```text
+out-001.csv
+out-002.csv
+out-003.csv
+out-004.csv
+out-005.csv
+```
+
+**Simple explanation:**
+
+> "Split large data into smaller files."
+
+---
+
+## Different Output Formats
+
+Supported output formats include:
+
+```text
+csv
+tsv
+jsonl
+sql
+```
+
+SQL output:
+
+```text
+--output-format sql --sql-table users
+```
+
+**Simple explanation:**
+
+> "Send the sorted data where you need it."
+
+---
+
+## Excel Support
+
+Excel files can be processed using:
+
+```text
+--mode excel
+```
+
+You can select a specific sheet:
+
+```text
+--sheet NAME
+```
+
+**Simple explanation:**
+
+> "Have a large Excel file? It can handle it."
+
+---
+
+## Compressed Files
+
+The engine can work with:
+
+```text
+.gz
+.zip
+```
+
+without manually extracting them first.
+
+`.zst` is currently rejected with guidance instead of silently failing.
+
+**Simple explanation:**
+
+> "No need to extract supported compressed files first."
+
+---
+
+## Automatic File Monitoring
+
+Use:
+
+```text
+--watch DIR
+```
+
+The engine can automatically process new files that appear in a directory.
+
+**Simple explanation:**
+
+> "Set it once and let it handle new files automatically."
+
+---
+
+## REST API
+
+Use:
+
+```text
+--api 127.0.0.1:8080
+```
+
+Applications can communicate with the sorting engine through an API.
+
+Example endpoints:
+
+```text
+POST /api/sort
+GET  /api/job/<id>
+```
+
+**Simple explanation:**
+
+> "Connect it to your own application."
+
+---
+
+## Web Dashboard
+
+Start the dashboard:
+
+```text
+--dashboard 127.0.0.1:8080
+```
+
+Open:
+
+```text
+http://127.0.0.1:8080/
+```
+
+The dashboard shows information such as:
+
+* Current progress
+* Current phase
+* Processing time
+* Records processed
+* Memory usage
+* Merge progress
+* Chunk progress
+
+It also provides:
+
+```text
+GET /metrics
+```
+
+for JSON monitoring and CI systems.
+
+Example:
+
+```json
+{
+  "phase": "merge",
+  "elapsed_s": 12.4,
+  "finished": false,
+  "records": 1000000,
+  "memory_bytes": 536870912
+}
+```
+
+> For security, bind the dashboard to `127.0.0.1` unless you have configured proper authentication and network security.
+
+---
+
+# Full CLI
+
+```text
+--input <path> --output <path> --max-memory <size>
 --mode numeric|string|jsonl|excel
---format csv --key-column N [--multi-key "1,3"] [--key-type numeric|string|date] [--delimiter ,]
---format jsonl --key-field user.age [--key-type numeric|string|date]
---header / --no-header   header keep / force-off (auto-detect if omitted)
---reverse, -r         descending
---unique, -u          drop identical rows (sort -u)
---dedupe-by 2 [--dedupe-keep first|last]   drop dupes by column
---limit N             Top-N only
---preview N [--preview-json]   head/tail preview, no commit (output optional)
---stats [--stats-json]         execution report block
---check               validate file only (exit 0=ready, 5=data issue)
---dry-run             smart estimate + recommendation (auto delimiter/header/encoding)
---encoding utf-8|latin-1|utf-16le|utf-16be (+ --encoding-in/--encoding-out)
-.gz/.zip transparent; .zst rejected with guidance; .xlsx via --sheet NAME
---merge F1 F2 ...     merge pre-sorted files (no re-sort) + --output
---output-format csv|tsv|jsonl|sql [--sql-table T]
---split-by N          split output into N files (out-001.ext...)
---temp-dir <path>     temp chunks on another drive
---resume [id|list]    resume interrupted run
---verify              re-read output, check order + row count
---threads N           (default: all cores)
---max-open-files N    (default: auto)
---quiet, --json, --log-file audit.jsonl, --dashboard [host:]PORT
---gui [host:]PORT [--brand NAME --brand-color HEX]   web console + presets + history
---api [host:]PORT [--api-token T]   REST API (POST /api/sort, GET /api/job/<id>)
---interactive         wizard tanya-jawab
---watch DIR [--output-dir D]        daemon auto-sort file baru
---version, --help
+
+--format csv
+--key-column N
+--multi-key "1,3"
+--key-type numeric|string|date
+--delimiter ,
+
+--format jsonl
+--key-field user.age
+
+--header
+--no-header
+
+--reverse, -r
+--unique, -u
+
+--dedupe-by 2
+--dedupe-keep first|last
+
+--limit N
+
+--preview N
+--preview-json
+
+--stats
+--stats-json
+
+--check
+--dry-run
+
+--encoding utf-8|latin-1|utf-16le|utf-16be
+--encoding-in
+--encoding-out
+
+.gz/.zip
+--sheet NAME
+
+--merge F1 F2 ...
+--output-format csv|tsv|jsonl|sql
+--sql-table T
+
+--split-by N
+--temp-dir <path>
+
+--resume [id|list]
+
+--verify
+
+--threads N
+--max-open-files N
+
+--quiet
+--json
+--log-file audit.jsonl
+
+--dashboard [host:]PORT
+
+--gui [host:]PORT
+--brand NAME
+--brand-color HEX
+
+--api [host:]PORT
+--api-token T
+
+--interactive
+
+--watch DIR
+--output-dir D
+
+--version
+--help
 ```
 
-Bahasa jualan per fitur: "Lihat hasil dulu" (preview), "Laporan tiap proses" (stats),
-"Tahu biaya sebelum jalan" (dry-run), "Pastikan file valid" (check),
-"Tinggal kasih file" (auto-deteksi), "Excel tidak kacau" (encoding),
-"Sort log JSON" (jsonl), "Bersihkan duplikat" (dedupe-by),
-"Gabung harian jadi bulanan" (merge), "Langsung masuk DB" (output-format),
-"Bagi data besar" (split-by), "Sekali setup selamanya klik" (preset),
-"Excel 500MB? Bisa." (xlsx), "Set dan lupakan" (watch),
-"Panggil dari aplikasi Anda" (API), "Software milik Anda" (white-label),
-"Tidak perlu extract" (kompresi), "Jalan di server Linux" (cross-platform).
+---
 
-Exit codes: `0` ok · `2` usage · `3` pre-flight · `4` I/O · `5` data · `6` verify.
+# Example Use Cases
 
-## Examples
+### Sort a large text file
 
 ```powershell
-# string sort, 8MB budget (forces multi-pass merge — good stress test)
 .\target\release\mergesort.exe --input words.txt --output words.sorted.txt --max-memory 8MB --mode string --verify
+```
 
-# CSV multi-key: city (col 2) then name (col 3)
+### Sort CSV using multiple columns
+
+```powershell
 .\target\release\mergesort.exe --input data.csv --output sorted.csv --max-memory 1GB --format csv --multi-key "2,3" --header --verify
+```
 
-# resume after crash / Ctrl-C
+### Continue an interrupted job
+
+```powershell
 .\target\release\mergesort.exe --input big.bin --output big.sorted.bin --max-memory 1GB --resume list
+```
+
+Then:
+
+```powershell
 .\target\release\mergesort.exe --input big.bin --output big.sorted.bin --max-memory 1GB --resume
 ```
 
-## Dashboard
+---
 
-Open `http://127.0.0.1:8080/` during a run. `GET /metrics` returns JSON for Prometheus/CI:
+# Performance
 
-```json
-{"phase":"merge","elapsed_s":12.4,"finished":false,"chunk":{...},"merge":{...},"records":1000000,"memory_bytes":536870912}
+The engine is designed for computers with limited RAM.
+
+Recommended starting point:
+
+```text
+--max-memory 50-70% of available RAM
 ```
 
-> Bind to `127.0.0.1` in production. No auth — do not expose to the public internet.
+For better performance:
 
-## Performance tips (for your sales demo)
+* Use an SSD for temporary files
+* Use `--temp-dir` on a fast drive
+* Keep enough free disk space for temporary files and output
+* Use multiple CPU threads when appropriate
+* Run `--dry-run` before very large jobs
 
-- `--max-memory 50-70% RAM` is the sweet spot; `--threads = cores`
-- Put `--temp-dir` on the fastest SSD, output on another disk if possible
-- `--dry-run` first to size chunks/fan-in for the customer
+---
 
-## Benchmark (real measurement, 2026-09-15)
+# Benchmark
 
-Dataset: binary numeric u64 (random 64-bit integers, no duplicates)
-System: Windows x64, SSD, CPU 8-core
-Config: `--max-memory 512MB --verify --mode numeric`
+**Real measurement: September 15, 2026**
 
-### 496 MB (65,000,000 records) — ran successfully (disk C: free terbatas, lihat catatan di bawah)
+### 496 MB File
 
-| Metric | Value |
-|---|---|
-| Input size | 496 MB (520,000,000 bytes = 65,000,000 × u64) |
-| Peak memory (RSS, JSON) | 486,948,864 bytes ≈ **464.4 MB** (90.7% dari 512MB budget) |
-| Total time (internal) | **24.641 seconds** (read 0.77s + sort 1.63s + merge 11.37s) |
-| Total time (wall-clock PS) | 24.78 seconds |
-| Throughput | 1207.5 MB/min = **20.1 MB/s** (input MB) |
-| Chunk count | **2 chunks** (kapasitas ~54.48M records/chunk @ 512MB) |
-| Merge pass count | **1 pass** (2-way merge, single fan-in level) |
-| Records read/written | 65,000,000 (row count match) |
-| Verify result | **OK** (`verified: true`, full order + row-count re-check) |
-| Exit code | 0 (OK) |
+Test data:
 
-### 5 GB Benchmark — Tidak Bisa Dijalankan Karena Disk C: Tidak Cukup
+* File size: **496 MB**
+* Records: **65,000,000**
+* Data type: Binary `u64`
+* Memory limit: **512 MB**
+* CPU: 8-core
+* Storage: SSD
+* Operating system: Windows x64
 
-Rencana awal: 5 GB input (640M u64) + 5 GB output + 5-6 GB temp chunks = ~16 GB peak disk usage.
-Actual kondisi saat ini:
-- Free C: **hanya ~7.15 GB di awal** (terpakai target/debug 2.3GB, target/release 800MB, test artifacts, pagefile)
-- Drive E: free 15.46 GB **tapi TRAE sandbox tidak mengizinkan write ke luar working directory C:**
-- Preflight disk check Engine berjalan BENAR: menolak sort 1.4GB input dengan pesan `kebutuhan ~4.40 GB, tersedia 3.44 GB`.
+Results:
 
-**Untuk menjalankan 5 GB benchmark nyata di mesin ini:**
-```powershell
-# Di PowerShell LUAR sandbox (atau izinkan write E: di Settings > Permission)
-$bench = 'E:\bench5g'
-mkdir $bench
-.\target\release\gen.exe $bench\input5g.bin 640000000 numeric        # 5120 MB = 640M u64
-.\target\release\mergesort.exe --input $bench\input5g.bin --output $bench\out.bin --max-memory 1GB --verify --json --stats --temp-dir "$bench\.temp"
-# Catat nilai dari JSON output: timing.total_s, peak_memory_bytes, chunks.count, merge passes (dari fan-in log), throughput_mb_per_min
-Remove-Item -Recurse -Force $bench   # cleanup setelah selesai
+| Metric          |        Result |
+| --------------- | ------------: |
+| Input size      |        496 MB |
+| Records         |    65,000,000 |
+| Peak memory     |      464.4 MB |
+| Processing time | 24.64 seconds |
+| Wall-clock time | 24.78 seconds |
+| Throughput      |     20.1 MB/s |
+| Chunks          |             2 |
+| Merge passes    |             1 |
+| Verification    |        Passed |
+| Exit code       |             0 |
+
+The complete input was sorted successfully and the final output passed the verification step.
+
+---
+
+# 5 GB Benchmark
+
+A 5 GB benchmark could not be completed on the test machine because there was not enough free disk space.
+
+The planned test required approximately:
+
+```text
+5 GB input
++ 5 GB output
++ 5-6 GB temporary files
+-------------------------
+≈ 16 GB peak disk usage
 ```
 
-## License
+The engine's disk-space check correctly stopped a test when there was not enough available space.
 
-MIT — see LICENSE. Custom builds (S3, gzip, GUI installer) available on request.
+This is intentional: **the engine checks disk requirements before starting large jobs instead of discovering the problem halfway through.**
+
+---
+
+# Exit Codes
+
+```text
+0 = Success
+2 = Invalid command or arguments
+3 = Not enough resources / pre-flight failure
+4 = File or disk error
+5 = Invalid data
+6 = Verification failed
+```
+
+This makes the engine easier to use in automation and CI pipelines.
+
+---
+
+# Built for Different Users
+
+### Non-technical staff
+
+Use the **Web GUI**.
+
+```text
+Select file → Choose options → Preview → Sort → Download
+```
+
+### Developers
+
+Use the **CLI** or **REST API**.
+
+### Data teams
+
+Use:
+
+* CSV / JSONL sorting
+* Top-N
+* Deduplication
+* Split output
+* Merge files
+* JSON monitoring
+
+### IT / Operations
+
+Use:
+
+* `--verify`
+* `--dry-run`
+* `--check`
+* `--resume`
+* Dashboard
+* JSON output
+* Audit logs
+* API
+* Watch mode
+
+---
+
+# Privacy
+
+The engine is **100% offline**.
+
+Your files do not need to be uploaded to a cloud service.
+
+Processing happens directly on your computer or server.
+
+---
+
+# Platform Support
+
+* Windows
+* Linux
+* macOS
+
+The application is distributed as a **single binary** and does not require a separate runtime.
+
+---
+
+# License
+
+MIT License.
+
+Custom commercial builds are available for:
+
+* S3 integration
+* Additional compression formats
+* Custom GUI
+* Custom branding
+* Enterprise deployments
+
+See `LICENSE` for the full license.
