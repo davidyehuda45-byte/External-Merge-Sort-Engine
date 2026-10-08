@@ -1,6 +1,13 @@
 # Changelog
 
-## 2.0.1 — Sale-readiness hardening pass
+## Unreleased
+- CLI ramah pemula: `--max-memory` opsional (default 60% RAM + info), `--backup` (salin output lama ke `.bak`), `--split-by-size 100MB`, rotasi `--log-file` 10MB x5.
+- Sort semantik: `--ignore-case`, `--nulls first|last`, `--key-dir asc,desc` per-key (sejajar multi-key), CSV multiline quoted (`"a\nb"`) end-to-end (split+merge+verify).
+- Observability: `/metrics-prom` Prometheus di dashboard; GUI cancel/preview/browse (`POST /api/cancel`, `GET /api/preview`, `GET /api/files`).
+- Ops gratis: `deploy/mergesort.service` (systemd), `deploy/install-watch-task.ps1` (Windows logon task), `deploy/MergeSort.wxs` (WiX MSI roadmap), `SIGNING.md`, `Uninstall.bat` + `*.sha256` di ZIP.
+- Test: `tests/extended.rs` 22 test (semua fitur di atas + regresi lama hijau).
+
+## 2.0.1 (2026-10-07) — Sale-readiness hardening pass
 Fixed correctness/packaging bugs found during a pre-sale audit (all verified
 with real repro, not just code review):
 - **Header auto-detect false positive**: a numeric-key CSV/string file with

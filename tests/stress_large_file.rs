@@ -41,7 +41,7 @@ fn verify_sorted_numeric(path: &Path) -> usize {
     assert_eq!(data.len() % 8, 0);
     let mut prev: Option<u64> = None;
     let mut n = 0usize;
-    for c in data.chunks_exact(8) {
+    for c in data.as_chunks::<8>().0.iter() {
         let v = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
         if let Some(p) = prev {
             assert!(v >= p, "unsorted at index {}", n);

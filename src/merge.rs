@@ -1,10 +1,11 @@
 // K-way merge phase: BinaryHeap over per-file MergeReaders, multi-pass when
 // the chunk count exceeds the open-file budget, byte accounting for metrics.
 // v2: CSV formats (key-column comparison) and resume-aware temp retention.
-use crate::chunk::{extract_csv_keys, extract_json_key, CsvKey, SortFormat};
+use crate::chunk::{extract_csv_keys, extract_json_key, CsvKey, SortFormat, SortOpts};
 use crate::manifest::Manifest;
 use crate::progress::RunState;
 use crate::temp_manager::remove_file_quiet;
+use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::cmp::Reverse;
@@ -14,13 +15,61 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+thread_local! {
+    static MERGE_DESC: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    static MERGE_NULLS_LAST: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Set per-run merge comparator (arah per-key + nulls-last).
+/// Heap (BinaryHeap) butuh Ord statis; opsi dinamis disalurkan via
+/// thread-local di atas yang diset di awal tiap merge_batch
+/// (merge heap single-threaded).
+fn set_merge_cmp(desc: &[bool], nulls_last: bool) {
+    MERGE_DESC.with(|d| *d.borrow_mut() = desc.to_vec());
+    MERGE_NULLS_LAST.with(|n| *n.borrow_mut() = nulls_last);
+}
+
+#[derive(PartialEq, Eq, Debug)]
 enum MergeValue {
     Num(u64),
     S(String),
     /// CSV: comparison key (possibly multi-column) + source record id.
     /// The record bytes are re-read from the source chunk at emit time.
     Csv(Vec<CsvKey>),
+}
+
+impl PartialOrd for MergeValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (MergeValue::Csv(a), MergeValue::Csv(b)) => {
+                let nulls_last = MERGE_NULLS_LAST.with(|n| *n.borrow());
+                MERGE_DESC.with(|d| SortOpts::cmp_keys(a, b, &d.borrow(), nulls_last))
+            }
+            _ => merge_value_ord(self, other),
+        }
+    }
+}
+
+/// Natural order untuk non-Csv (Num/S) — arah global via heap (Reverse wrapper),
+/// bukan di sini. Dipisah agar Ord manual di atas tetap jelas.
+fn merge_value_ord(a: &MergeValue, b: &MergeValue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (MergeValue::Num(x), MergeValue::Num(y)) => x.cmp(y),
+        (MergeValue::S(x), MergeValue::S(y)) => x.cmp(y),
+        (MergeValue::Csv(x), MergeValue::Csv(y)) => x.cmp(y),
+        // Urutan varian tetap: Num < S < Csv (tak pernah campur dalam satu run).
+        (MergeValue::Num(_), _) => Ordering::Less,
+        (_, MergeValue::Num(_)) => Ordering::Greater,
+        (MergeValue::S(_), _) => Ordering::Less,
+        (_, MergeValue::S(_)) => Ordering::Greater,
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -35,6 +84,7 @@ struct HeapItem {
 struct MergeReader {
     inner: BufReader<File>,
     fmt: SortFormat,
+    opts: SortOpts,
     rec_buf: Vec<u8>,
     num_block: Vec<u8>,
     num_pos: usize,
@@ -46,12 +96,12 @@ const NUM_BLOCK_BYTES: usize = 64 * 1024;
 impl MergeReader {
     #[allow(dead_code)]
     fn open(path: &Path, fmt: SortFormat, buf_size: usize) -> std::io::Result<MergeReader> {
-        Self::open_skip_header(path, fmt, buf_size, false)
+        Self::open_skip_header(path, fmt, SortOpts::default(), buf_size, false)
     }
 
     /// Opens a chunk with optional first-line skip (used by --merge for
     /// header rows in files[1..] without copying data).
-    fn open_skip_header(path: &Path, fmt: SortFormat, buf_size: usize, skip_first: bool) -> std::io::Result<MergeReader> {
+    fn open_skip_header(path: &Path, fmt: SortFormat, opts: SortOpts, buf_size: usize, skip_first: bool) -> std::io::Result<MergeReader> {
         let f = File::open(path)?;
         let mut inner = BufReader::with_capacity(buf_size, f);
         if skip_first {
@@ -61,6 +111,7 @@ impl MergeReader {
         Ok(MergeReader {
             inner,
             fmt,
+            opts,
             rec_buf: Vec::with_capacity(256),
             num_block: Vec::new(),
             num_pos: 0,
@@ -87,6 +138,8 @@ impl MergeReader {
 
     /// Reads one line into `self.rec_buf` (without terminators); empty result at EOF.
     /// Returns Err on read failure.
+    /// CSV multiline: physical lines digabung dengan `\n` sampai quotes balance,
+    /// aturan sama dengan split phase (`chunk::quotes_balanced`).
     fn read_line_into_rec(&mut self) -> std::io::Result<usize> {
         self.rec_buf.clear();
         let n = self.inner.read_until(b'\n', &mut self.rec_buf)?;
@@ -101,15 +154,36 @@ impl MergeReader {
             end -= 1;
         }
         self.rec_buf.truncate(end);
+        if matches!(self.fmt, SortFormat::Csv { .. }) {
+            while !crate::chunk::quotes_balanced(&self.rec_buf) {
+                let mut extra = Vec::new();
+                let m = self.inner.read_until(b'\n', &mut extra)?;
+                if m == 0 {
+                    break;
+                }
+                let mut eend = extra.len();
+                if extra.last() == Some(&b'\n') {
+                    eend -= 1;
+                }
+                if eend > 0 && extra[eend - 1] == b'\r' {
+                    eend -= 1;
+                }
+                self.rec_buf.push(b'\n');
+                self.rec_buf.extend_from_slice(&extra[..eend]);
+            }
+            return Ok(self.rec_buf.len());
+        }
         Ok(end)
     }
 
     fn next(&mut self) -> std::io::Result<Option<MergeValue>> {
-        // Clone the format tag so `self` can be mutably borrowed below while
-        // matching on the format (Csv's key list is tiny).
-        let fmt = self.fmt.clone();
-        match fmt {
-            SortFormat::Numeric => {
+        // Borrowed dispatch: the old code cloned `self.fmt` on every record
+        // (a Vec clone per row for Csv/Jsonl key lists). `kind()` returns a
+        // 'static str so its borrow ends immediately; each arm re-borrows
+        // `&self.fmt` only after the mutable `read_line_into_rec` call,
+        // keeping the borrow checker happy with zero per-record allocation.
+        match self.fmt.kind() {
+            "numeric" => {
                 if self.num_pos + 8 > self.num_block.len()
                     && (self.eof || !self.refill_num_block()?) {
                         self.eof = true;
@@ -127,28 +201,38 @@ impl MergeReader {
                 self.num_pos += 8;
                 Ok(Some(MergeValue::Num(u64::from_le_bytes(b))))
             }
-            SortFormat::String => {
+            "string" => {
                 let n = self.read_line_into_rec()?;
                 if n == 0 && self.rec_buf.is_empty() {
                     return Ok(None);
                 }
-                Ok(Some(MergeValue::S(String::from_utf8_lossy(&self.rec_buf).into_owned())))
+                let s = String::from_utf8_lossy(&self.rec_buf).into_owned();
+                Ok(Some(MergeValue::S(if self.opts.ignore_case { s.to_lowercase() } else { s })))
             }
-            SortFormat::Csv { delimiter, keys, key_numeric } => {
+            "csv" => {
                 let n = self.read_line_into_rec()?;
                 if n == 0 && self.rec_buf.is_empty() {
                     return Ok(None);
                 }
-                let k = extract_csv_keys(&self.rec_buf, delimiter, &keys, key_numeric)
+                let (delimiter, keys, key_numeric) = match &self.fmt {
+                    SortFormat::Csv { delimiter, keys, key_numeric } => (*delimiter, keys, *key_numeric),
+                    _ => unreachable!(),
+                };
+                let k = extract_csv_keys(&self.rec_buf, delimiter, keys, key_numeric, self.opts.ignore_case)
                     .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))?;
                 Ok(Some(MergeValue::Csv(k)))
             }
-            SortFormat::Jsonl { field, key_numeric } => {
+            _ => {
+                // jsonl
                 let n = self.read_line_into_rec()?;
                 if n == 0 && self.rec_buf.is_empty() {
                     return Ok(None);
                 }
-                let k = extract_json_key(&self.rec_buf, &field, key_numeric)
+                let (field, key_numeric) = match &self.fmt {
+                    SortFormat::Jsonl { field, key_numeric } => (field, *key_numeric),
+                    _ => unreachable!(),
+                };
+                let k = extract_json_key(&self.rec_buf, field, key_numeric, self.opts.ignore_case)
                     .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))?;
                 Ok(Some(MergeValue::Csv(k)))
             }
@@ -169,8 +253,10 @@ pub struct MergeStats {
 /// be retried from the same chunks.
 /// `dedupe_by` (`--dedupe-by`) collapses rows with equal key-column values on
 /// the final pass only. keep-first uses a hash set (also collapses scattered
-/// duplicates); keep-last keeps the last row of each *consecutive* equal-key
-/// group — sort by the dedupe column for exact keep-last semantics.
+/// duplicates) — unbounded in key cardinality, warns past 1M keys, never
+/// evicted (eviction would silently resurrect duplicates); keep-last keeps
+/// the last row of each *consecutive* equal-key group — sort by the dedupe
+/// column for exact keep-last semantics.
 #[allow(clippy::too_many_arguments)]
 pub fn merge_all(
     chunk_paths: Vec<PathBuf>,
@@ -187,8 +273,9 @@ pub fn merge_all(
     unique: bool,
     dedupe_by: Option<Vec<usize>>,
     dedupe_keep_last: bool,
+    opts: SortOpts,
 ) -> std::io::Result<MergeStats> {
-    merge_all_inner(chunk_paths, output, fmt, fan_in, run_dir, reader_buf_size, writer_buf_size, keep_temps, manifest, state, reverse, unique, dedupe_by, dedupe_keep_last, &[])
+    merge_all_inner(chunk_paths, output, fmt, fan_in, run_dir, reader_buf_size, writer_buf_size, keep_temps, manifest, state, reverse, unique, dedupe_by, dedupe_keep_last, &[], opts)
 }
 
 /// Public entry for --merge mode (pre-sorted files, no manifest/resume).
@@ -208,8 +295,9 @@ pub fn merge_all_inner_public(
     dedupe_by: Option<Vec<usize>>,
     dedupe_keep_last: bool,
     skip_first: &[bool],
+    opts: SortOpts,
 ) -> std::io::Result<MergeStats> {
-    merge_all_inner(chunk_paths, output, fmt, fan_in, run_dir, reader_buf_size, writer_buf_size, false, manifest, state, reverse, unique, dedupe_by, dedupe_keep_last, skip_first)
+    merge_all_inner(chunk_paths, output, fmt, fan_in, run_dir, reader_buf_size, writer_buf_size, false, manifest, state, reverse, unique, dedupe_by, dedupe_keep_last, skip_first, opts)
 }
 
 /// Inner merge with per-file header skips (used by --merge for headers in
@@ -232,6 +320,7 @@ fn merge_all_inner(
     dedupe_by: Option<Vec<usize>>,
     dedupe_keep_last: bool,
     skip_first: &[bool],
+    opts: SortOpts,
 ) -> std::io::Result<MergeStats> {
     let mut io_dur = Duration::ZERO;
     let mut bytes_read: usize = 0;
@@ -277,7 +366,7 @@ fn merge_all_inner(
         let t0 = Instant::now();
         let batch = current.clone();
         let skips = skip_first.to_vec();
-        let bytes = merge_batch(&batch, output, &fmt, reader_buf_size, writer_buf_size, state, io_per_rec, reverse, true, dedupe_by.clone(), dedupe_keep_last, if skips.is_empty() { None } else { Some(skips) })?;
+        let bytes = merge_batch(&batch, output, &fmt, reader_buf_size, writer_buf_size, state, io_per_rec, reverse, true, dedupe_by.clone(), dedupe_keep_last, if skips.is_empty() { None } else { Some(skips) }, &opts)?;
         if !keep_temps {
             for p in &batch {
                 remove_file_quiet(p);
@@ -343,7 +432,7 @@ fn merge_all_inner(
                 } else {
                     None
                 };
-                let bytes = merge_batch(batch, output, &fmt, reader_buf_size, writer_buf_size, state, io_per_rec, reverse, dedup_now, by_now, dedupe_keep_last, skips)?;
+                let bytes = merge_batch(batch, output, &fmt, reader_buf_size, writer_buf_size, state, io_per_rec, reverse, dedup_now, by_now, dedupe_keep_last, skips, &opts)?;
                 if !keep_temps {
                     for p in batch {
                         remove_file_quiet(p);
@@ -351,21 +440,24 @@ fn merge_all_inner(
                 }
                 bytes
             } else {
-                let tmp = run_dir.join(Path::new(&format!("merge_p{:02}_{:04}.dat", pass, batch_idx)));
+                let tmp = run_dir.join(Path::new(&format!("msort_merge_p{:02}_{:04}.dat", pass, batch_idx)));
                 let skips = if pass == 0 && !skip_first.is_empty() {
                     Some(skip_first[i..end].to_vec())
                 } else {
                     None
                 };
-                let bytes = merge_batch(batch, &tmp, &fmt, reader_buf_size, writer_buf_size, state, io_per_rec, reverse, false, None, false, skips)?;
+                let bytes = merge_batch(batch, &tmp, &fmt, reader_buf_size, writer_buf_size, state, io_per_rec, reverse, false, None, false, skips, &opts)?;
                 for p in batch {
                     // In keep_temps (resume) mode the original chunk_*.dat files
                     // must survive: the manifest still references them and a
                     // crashed merge must be retryable. Only derived
-                    // intermediates (merge_p*) may be reclaimed.
+                    // intermediates (msort_merge_p*) may be reclaimed.
+                    // NOTE: the `msort_merge_p` prefix is namespaced so a
+                    // user-supplied --merge input named `merge_p*.dat` is
+                    // never mistaken for an intermediate and deleted.
                     let is_intermediate = p
                         .file_name()
-                        .map(|n| n.to_string_lossy().starts_with("merge_p"))
+                        .map(|n| n.to_string_lossy().starts_with("msort_merge_p"))
                         .unwrap_or(false);
                     if !keep_temps || is_intermediate {
                         remove_file_quiet(p);
@@ -434,13 +526,16 @@ fn merge_batch(
     dedupe_by: Option<Vec<usize>>,
     dedupe_keep_last: bool,
     skips: Option<Vec<bool>>,
+    opts: &SortOpts,
 ) -> std::io::Result<usize> {
+    set_merge_cmp(&opts.key_desc, opts.nulls_last);
+    let ignore_case = opts.ignore_case;
     let mut readers: Vec<MergeReader> = Vec::with_capacity(batch.len());
     let mut total_bytes: usize = 0;
     for (idx, p) in batch.iter().enumerate() {
         total_bytes += std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0);
         let skip = skips.as_ref().and_then(|s| s.get(idx)).copied().unwrap_or(false);
-        readers.push(MergeReader::open_skip_header(p, fmt.clone(), reader_buf_size, skip)?);
+        readers.push(MergeReader::open_skip_header(p, fmt.clone(), opts.clone(), reader_buf_size, skip)?);
     }
 
     let out_file = File::create(dest)?;
@@ -458,7 +553,17 @@ fn merge_batch(
     let mut has_last = false;
     // --dedupe-by state. keep-first: hash set (handles scattered dupes).
     // keep-last: consecutive-group buffering (sort by dedupe col for exactness).
+    //
+    // LIMIT NOTE: the keep-first `seen_keys` set holds one entry per distinct
+    // key for the whole final pass — memory grows with key cardinality, not
+    // input size. There is deliberately no LRU eviction: evicting a key would
+    // re-emit a later scattered duplicate as "new" and corrupt results
+    // silently. Instead we warn once past 1M keys so unexpected RSS growth is
+    // attributable (mitigation: pre-aggregate, dedupe on fewer columns, or
+    // add RAM). keep-last buffering is O(1) (one group) and unaffected.
+    const DEDUPE_KEY_WARN: usize = 1_000_000;
     let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut dedupe_warned = false;
     let mut group_key: Vec<u8> = Vec::new();
     let mut group_has = false;
     let mut group_buf: Vec<u8> = Vec::new();
@@ -466,8 +571,9 @@ fn merge_batch(
     let by_active = by_cols.is_some();
 
     // Dedupe key for the record currently buffered in readers[src] (csv only).
+    // ignore_case: key di-lowercase agar --unique/--dedupe-by konsisten dengan sort.
     let key_of = |readers: &Vec<MergeReader>, src: usize, fmt: &SortFormat, cols: &Option<Vec<usize>>| -> Vec<u8> {
-        match fmt {
+        let mut raw = match fmt {
             SortFormat::Csv { delimiter, .. } => match cols.as_ref() {
                 Some(cs) => {
                     let rec = &readers[src].rec_buf;
@@ -486,7 +592,11 @@ fn merge_batch(
                 None => readers[src].rec_buf.clone(),
             },
             _ => readers[src].rec_buf.clone(),
+        };
+        if ignore_case {
+            raw = String::from_utf8_lossy(&raw).to_lowercase().into_bytes();
         }
+        raw
     };
 
     macro_rules! account {
@@ -536,6 +646,13 @@ fn merge_batch(
                     // keep-first scattered duplicate: skip
                 } else {
                     seen_keys.insert(k);
+                    if !dedupe_warned && seen_keys.len() > DEDUPE_KEY_WARN {
+                        dedupe_warned = true;
+                        eprintln!(
+                            "warning: --dedupe-by keep-first memegang {} kunci unik (tumbuh dengan kardinalitas; bukan LRU agar duplikat tersebar tidak muncul ulang)",
+                            seen_keys.len()
+                        );
+                    }
                     out.write_all(&readers[$src].rec_buf)?;
                     out.write_all(b"\n")?;
                 }
@@ -567,7 +684,13 @@ fn merge_batch(
                 }
                 MergeValue::S(_) | MergeValue::Csv(_) => {
                     let cur = readers[src].rec_buf.clone();
-                    let dup = dedup && has_last && cur == last_bytes;
+                    let dup = dedup && has_last && {
+                        if ignore_case {
+                            cur.eq_ignore_ascii_case(&last_bytes)
+                        } else {
+                            cur == last_bytes
+                        }
+                    };
                     last_bytes = cur;
                     has_last = true;
                     emit_text!(src, dup);
@@ -600,7 +723,13 @@ fn merge_batch(
                 // reader — no per-record String allocation needed.
                 MergeValue::S(_) | MergeValue::Csv(_) => {
                     let cur = readers[src].rec_buf.clone();
-                    let dup = dedup && has_last && cur == last_bytes;
+                    let dup = dedup && has_last && {
+                        if ignore_case {
+                            cur.eq_ignore_ascii_case(&last_bytes)
+                        } else {
+                            cur == last_bytes
+                        }
+                    };
                     last_bytes = cur;
                     has_last = true;
                     emit_text!(src, dup);

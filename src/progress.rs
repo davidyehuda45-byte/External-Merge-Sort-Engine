@@ -131,11 +131,11 @@ impl Progress {
 
                 // Chunk bar.
                 {
-                    let pct = if bytes_total > 0 {
-                        bytes_read.min(bytes_total) * 100 / bytes_total
-                    } else {
-                        0
-                    };
+                    let pct = bytes_read
+                        .min(bytes_total)
+                        .checked_mul(100)
+                        .and_then(|v| v.checked_div(bytes_total))
+                        .unwrap_or(0);
                     chunk_bar.set_length(100);
                     chunk_bar.set_position(pct);
                     let mbps = if el > 0.05 {
@@ -159,11 +159,11 @@ impl Progress {
 
                 // Merge bar.
                 {
-                    let pct = if merge_total > 0 {
-                        merge_done.min(merge_total) * 100 / merge_total
-                    } else {
-                        0
-                    };
+                    let pct = merge_done
+                        .min(merge_total)
+                        .checked_mul(100)
+                        .and_then(|v| v.checked_div(merge_total))
+                        .unwrap_or(0);
                     merge_bar.set_length(100);
                     merge_bar.set_position(pct);
                     let mbps = if el > 0.05 {
@@ -205,7 +205,14 @@ impl Progress {
 /// Starts the dashboard HTTP server on `bind:port` (port 0 = random).
 /// Returns the bound port. Serves "/" (auto-refresh HTML) and "/metrics"
 /// (JSON) until the process exits.
+///
+/// PERINGATAN AUTH: dashboard ini tanpa token/autentikasi — hanya aman bila
+/// bind 127.0.0.1. Jangan expose ke 0.0.0.0 / jaringan publik; siapa pun yang
+/// bisa mencapai port ini dapat membaca metrik live (fase, throughput, RSS).
 pub fn start_dashboard(bind: &str, port: u16, state: Arc<RunState>) -> std::io::Result<u16> {
+    if bind != "127.0.0.1" && bind != "localhost" && bind != "::1" {
+        eprintln!("PERINGATAN: dashboard tanpa auth di-bind ke '{}' — hanya aman di 127.0.0.1!", bind);
+    }
     let listener = TcpListener::bind((bind, port))?;
     let bound_port: u16 = match listener.local_addr() {
         Ok(a) => a.port(),
@@ -231,20 +238,35 @@ fn handle_conn(mut stream: TcpStream, state: Arc<RunState>) {
         Err(_) => return,
     };
     let req = String::from_utf8_lossy(&buf[..n]);
-    // Normalize: drop query string and leading slashes so "//metrics?x"
-    // still resolves to the metrics endpoint.
     let raw = req.split_ascii_whitespace().nth(1).unwrap_or("/");
     let path = raw.split('?').next().unwrap_or("/");
-    let norm = path.trim_start_matches('/');
+    // Validasi ketat: hanya "/" dan "/metrics". Tolak traversal (..) dan
+    // normalisasi ganda (//) yang bisa mengaburkan routing/proxy.
+    if path.contains("..") || path.contains("//") {
+        let body = "not found";
+        let resp = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
 
-    let (ctype, body) = if norm == "metrics" || norm.starts_with("metrics/") {
-        ("application/json", metrics_json(&state))
+    let (code, ctype, body) = if path == "/" {
+        ("200 OK", "text/html; charset=utf-8", dashboard_html().to_string())
+    } else if path == "/metrics" {
+        ("200 OK", "application/json", metrics_json(&state))
+    } else if path == "/metrics-prom" {
+        ("200 OK", "text/plain; version=0.0.4", metrics_prom(&state))
     } else {
-        ("text/html; charset=utf-8", dashboard_html().to_string())
+        ("404 Not Found", "text/plain", "not found".to_string())
     };
 
     let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        code,
         ctype,
         body.len(),
         body
@@ -273,8 +295,16 @@ fn metrics_json(state: &RunState) -> String {
     let iob = state.io_bytes.load(Ordering::Relaxed);
     let el = elapsed_secs();
 
-    let chunk_pct = if bytes_total > 0 { bytes_read.min(bytes_total) * 100 / bytes_total } else { 0 };
-    let merge_pct = if merge_total > 0 { merge_done.min(merge_total) * 100 / merge_total } else { 0 };
+    let chunk_pct = bytes_read
+        .min(bytes_total)
+        .checked_mul(100)
+        .and_then(|v| v.checked_div(bytes_total))
+        .unwrap_or(0);
+    let merge_pct = merge_done
+        .min(merge_total)
+        .checked_mul(100)
+        .and_then(|v| v.checked_div(merge_total))
+        .unwrap_or(0);
     let chunk_mbps = if el > 0.05 { bytes_read as f64 / (1024.0 * 1024.0) / el } else { 0.0 };
     let merge_mbps = if el > 0.05 { iob as f64 / (1024.0 * 1024.0) / el } else { 0.0 };
 
@@ -299,6 +329,38 @@ fn metrics_json(state: &RunState) -> String {
         merge_mbps,
         state.records.load(Ordering::Relaxed),
         mem
+    )
+}
+
+/// Prometheus exposition format untuk /metrics-prom (gratis, tanpa dep baru).
+/// Metric: mergesort_phase_info, bytes, records, memory.
+fn metrics_prom(state: &RunState) -> String {
+    let phase = state.phase_name();
+    let bytes_read = state.input_bytes_read.load(Ordering::Relaxed);
+    let bytes_total = state.input_total_bytes.load(Ordering::Relaxed);
+    let merge_done = state.merge_done.load(Ordering::Relaxed);
+    let merge_total = state.merge_total.load(Ordering::Relaxed);
+    let records = state.records.load(Ordering::Relaxed);
+    format!(
+        "# HELP mergesort_phase_info current phase (1=active).\n\
+         # TYPE mergesort_phase_info gauge\n\
+         mergesort_phase_info{{phase=\"{}\"}} 1\n\
+         # HELP mergesort_bytes_read input bytes read.\n\
+         # TYPE mergesort_bytes_read counter\n\
+         mergesort_bytes_read {}\n\
+         # HELP mergesort_bytes_total input bytes total.\n\
+         # TYPE mergesort_bytes_total gauge\n\
+         mergesort_bytes_total {}\n\
+         # HELP mergesort_merge_done merge units done.\n\
+         # TYPE mergesort_merge_done counter\n\
+         mergesort_merge_done {}\n\
+         # HELP mergesort_merge_total merge units total.\n\
+         # TYPE mergesort_merge_total gauge\n\
+         mergesort_merge_total {}\n\
+         # HELP mergesort_records sorted records.\n\
+         # TYPE mergesort_records gauge\n\
+         mergesort_records {}\n",
+        phase, bytes_read, bytes_total, merge_done, merge_total, records
     )
 }
 

@@ -8,8 +8,9 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::time::Duration;
 
 pub struct ReadAhead {
-    block_rx: Receiver<std::io::Result<Vec<u8>>>,
+    block_rx: Option<Receiver<std::io::Result<Vec<u8>>>>,
     recycle_tx: SyncSender<Vec<u8>>,
+    handle: Option<std::thread::JoinHandle<()>>,
     finished: bool,
 }
 
@@ -30,14 +31,11 @@ impl ReadAhead {
             let _ = recycle_tx.send(Vec::with_capacity(block_size));
         }
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let mut file = file;
             loop {
                 // Get a buffer: prefer a recycled one, else allocate.
-                let mut buf: Vec<u8> = match recycle_rx.try_recv() {
-                    Ok(b) => b,
-                    Err(_) => Vec::new(),
-                };
+                let mut buf: Vec<u8> = recycle_rx.try_recv().unwrap_or_default();
                 // NOTE: this std's `read(&mut Vec)` fills only up to the Vec's
                 // current len, so we resize to the block size first and truncate
                 // to the number of bytes actually read afterwards.
@@ -73,26 +71,58 @@ impl ReadAhead {
             }
         });
 
-        Ok(ReadAhead { block_rx, recycle_tx, finished: false })
+        Ok(ReadAhead { block_rx: Some(block_rx), recycle_tx, handle: Some(handle), finished: false })
     }
 
     /// Returns the next filled block, or None at end of stream.
     /// The returned Vec must be returned via `recycle` after use (or dropped).
+    ///
+    /// `None` is returned ONLY when the reader thread closed the channel
+    /// (clean EOF or a delivered `Err`). A `recv_timeout` expiry is a stall,
+    /// not EOF: it is logged and retried up to 3x (600s each) before giving
+    /// up with a warning + `None` so a hung disk doesn't hang forever
+    /// silently.
     pub fn next_block(&mut self) -> Option<std::io::Result<Vec<u8>>> {
         if self.finished {
             return None;
         }
-        match self.block_rx.recv_timeout(Duration::from_secs(600)) {
-            Ok(res) => Some(res),
-            Err(_) => {
-                self.finished = true;
-                None
+        let rx = self.block_rx.as_ref()?;
+        for attempt in 1..=3 {
+            match rx.recv_timeout(Duration::from_secs(600)) {
+                Ok(res) => return Some(res),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.finished = true;
+                    return None;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!(
+                        "warning: read-ahead stall 600s (attempt {}/3) — retrying",
+                        attempt
+                    );
+                }
             }
         }
+        eprintln!("warning: read-ahead timeout after 3x600s — treating as EOF");
+        self.finished = true;
+        None
     }
 
-    /// Returns a consumed buffer to the pool.
+    /// Returns a consumed buffer to the pool (non-blocking: drops the buffer
+    /// on a full pool instead of stalling the consumer).
     pub fn recycle(&self, buf: Vec<u8>) {
-        let _ = self.recycle_tx.send(buf);
+        let _ = self.recycle_tx.try_send(buf);
+    }
+}
+
+impl Drop for ReadAhead {
+    fn drop(&mut self) {
+        // Drop the receiver FIRST so a reader thread blocked on a full queue
+        // observes Disconnected and exits; only then join (no deadlock).
+        self.finished = true;
+        drop(self.block_rx.take());
+        if let Some(h) = self.handle.take() {
+            // Best-effort join; must never panic inside Drop.
+            let _ = h.join();
+        }
     }
 }

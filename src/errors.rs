@@ -18,7 +18,11 @@ pub const VERIFY: i32 = 6;
 
 /// Prints a human-readable error prefixed with the exit code (machine-greppable)
 /// and terminates the process with that code.
+///
+/// Best-effort staging cleanup runs first so `.part` files never linger
+/// after any `fail()` exit path (success paths clean up explicitly).
 pub fn fail(code: i32, msg: &str) -> ! {
+    crate::temp_manager::cleanup_staging();
     eprintln!("error[{}]: {}", code, msg);
     std::process::exit(code);
 }
@@ -32,6 +36,15 @@ pub fn io_hint(e: &std::io::Error) -> String {
         ),
         std::io::ErrorKind::PermissionDenied => format!(
             "{} (izin ditolak: periksa hak akses file/direktori, atau jalankan tanpa opsi yang butuh akses khusus)", s
+        ),
+        std::io::ErrorKind::NotFound => format!(
+            "{} (file/direktori tidak ditemukan: periksa ejaan path, mount drive, dan working directory)", s
+        ),
+        std::io::ErrorKind::Interrupted => format!(
+            "{} (I/O terinterupsi sinyal: coba lagi; gunakan --resume untuk melanjutkan run yang terputus)", s
+        ),
+        std::io::ErrorKind::BrokenPipe => format!(
+            "{} (broken pipe: downstream menutup output lebih awal, mis. `| head`; bukan error sort)", s
         ),
         _ => s,
     }

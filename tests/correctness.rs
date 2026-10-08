@@ -50,7 +50,8 @@ fn write_numeric(path: &Path, values: &[u64]) {
 fn read_numeric(path: &Path) -> Vec<u64> {
     let data = fs::read(path).unwrap();
     assert_eq!(data.len() % 8, 0, "output length not a multiple of 8");
-    data.chunks_exact(8)
+    data.as_chunks::<8>().0
+        .iter()
         .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
         .collect()
 }

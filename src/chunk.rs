@@ -55,6 +55,7 @@ pub fn extract_json_key(
     rec: &[u8],
     field: &[String],
     key_numeric: bool,
+    ignore_case: bool,
 ) -> Result<Vec<CsvKey>, String> {
     let v: serde_json::Value = serde_json::from_slice(rec)
         .map_err(|e| format!("invalid JSON line: {}", e))?;
@@ -89,7 +90,7 @@ pub fn extract_json_key(
             // objects/arrays: canonical JSON string compare
             cur.to_string()
         };
-        Ok(vec![CsvKey::S(s)])
+        Ok(vec![CsvKey::S(if ignore_case { s.to_lowercase() } else { s })])
     }
 }
 
@@ -101,13 +102,63 @@ pub enum CsvKey {
     S(String),
 }
 
+/// Gratis sort options (tanpa dep baru): case-insensitive, nulls-last,
+/// dan arah per-key (sejajar `keys`; kosong = semua asc).
+#[derive(Clone, Debug, Default)]
+pub struct SortOpts {
+    pub ignore_case: bool,
+    pub nulls_last: bool,
+    pub key_desc: Vec<bool>,
+}
+
+impl SortOpts {
+    /// Bandingkan dua key-vec dengan arah per-key + nulls-last.
+    /// `""` (string kosong) dianggap NULL.
+    pub fn cmp_keys(a: &[CsvKey], b: &[CsvKey], desc: &[bool], nulls_last: bool) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            let d = desc.get(i).copied().unwrap_or(false);
+            let ord = match (x, y) {
+                (CsvKey::S(s1), CsvKey::S(s2)) if s1.is_empty() || s2.is_empty() => {
+                    match (s1.is_empty(), s2.is_empty()) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) => {
+                            if nulls_last {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            }
+                        }
+                        (false, true) => {
+                            if nulls_last {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => x.cmp(y),
+            };
+            if ord != Ordering::Equal {
+                return if d { ord.reverse() } else { ord };
+            }
+        }
+        a.len().cmp(&b.len())
+    }
+}
+
 /// Extracts the key columns from one raw CSV record.
 /// `keys` must be sorted ascending (validated by the CLI layer).
+/// `ignore_case`: string key di-lowercase agar `--ignore-case` konsisten
+/// di chunk-sort, merge, dan verify (satu sumber kebenaran).
 pub fn extract_csv_keys(
     rec: &[u8],
     delimiter: u8,
     keys: &[usize],
     key_numeric: bool,
+    ignore_case: bool,
 ) -> Result<Vec<CsvKey>, String> {
     let mut out = Vec::with_capacity(keys.len());
     // Keys are validated ascending by the CLI layer, so one pass over the
@@ -128,7 +179,15 @@ pub fn extract_csv_keys(
         }
         match fields.next() {
             Some(field) => {
-                let f = std::str::from_utf8(field).unwrap_or("");
+                let f = match std::str::from_utf8(field) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        eprintln!("warning: record CSV dengan UTF-8 invalid pada kolom kunci {}", k);
+                        return Err(format!(
+                            "CSV key column {} contains invalid UTF-8", k
+                        ));
+                    }
+                };
                 if key_numeric {
                     match f.trim().parse::<u64>() {
                         Ok(v) => out.push(CsvKey::N(v)),
@@ -140,7 +199,8 @@ pub fn extract_csv_keys(
                         }
                     }
                 } else {
-                    out.push(CsvKey::S(f.to_string()));
+                    let s = f.to_string();
+                    out.push(CsvKey::S(if ignore_case { s.to_lowercase() } else { s }));
                 }
                 idx += 1;
             }
@@ -155,7 +215,35 @@ pub fn extract_csv_keys(
     Ok(out)
 }
 
+/// true bila jumlah quote ganda tak-escape genap (record CSV selesai).
+/// `""` dihitung escape (satu quote logis), bukan penutup.
+/// Pub agar merge + verify memakai aturan gabung yang sama dengan split.
+pub fn quotes_balanced(line: &[u8]) -> bool {
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < line.len() {
+        if line[i] == b'"' {
+            if i + 1 < line.len() && line[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            count += 1;
+        }
+        i += 1;
+    }
+    count.is_multiple_of(2)
+}
 /// Per-element memory estimate used to derive chunk capacity.
+///
+/// Documented breakdown (64-bit):
+/// - Numeric: 8 = the u64 payload itself (Vec<u64> has no per-element header).
+/// - String: 24 (String header: ptr+len+cap) + ~32 estimated average payload
+///   slack for short lines. Long-line inputs therefore fit fewer records than
+///   estimated — the byte-budget check (`cur_bytes >= cap_bytes`) is the real
+///   backstop; this constant only sizes the record-count budget.
+/// - Csv/Jsonl: 3×24 (raw record Vec<u8> header + two key Vec/String headers
+///   for the common 2-key case) + 24 payload slack. Keys are re-extracted at
+///   flush time, so this is deliberately conservative.
 pub fn elem_overhead(fmt: &SortFormat) -> usize {
     match fmt {
         SortFormat::Numeric => 8, // u64 payload
@@ -216,9 +304,11 @@ pub fn split_and_sort(
     state: Option<&Arc<RunState>>,
     reverse: bool,
     skip_first_line: bool,
+    opts: SortOpts,
 ) -> std::io::Result<SplitResult> {
     let mut ctx = SplitCtx {
         fmt,
+        opts,
         input: input.to_path_buf(),
         run_dir: run_dir.to_path_buf(),
         capacity,
@@ -252,6 +342,7 @@ pub fn split_and_sort(
 
 struct SplitCtx<'a> {
     fmt: SortFormat,
+    opts: SortOpts,
     input: PathBuf,
     run_dir: PathBuf,
     capacity: usize,
@@ -302,6 +393,10 @@ impl<'a> SplitCtx<'a> {
         let mut reader = ReadAhead::open(&self.input, 256 * 1024, 4)?;
         let cap_bytes = self.capacity.saturating_mul(elem_overhead(&self.fmt));
         let mut carry: Vec<u8> = Vec::new();
+        // Multiline CSV: record dengan quote tak-seimbang disambung dengan \n
+        // sampai balance. Hanya untuk Csv; String/Jsonl tetap per-baris.
+        let multiline = matches!(self.fmt, SortFormat::Csv { .. });
+        let mut pending: Vec<u8> = Vec::new();
 
         loop {
             let t0 = Instant::now();
@@ -367,7 +462,24 @@ impl<'a> SplitCtx<'a> {
                         // or before the resume offset (which always sits on a
                         // line boundary).
                         let line_end = self.bytes_before_block + (i as u64) + 1;
-                        self.push_line(line, line_end <= self.resume_from_offset)?;
+                        if multiline {
+                            if pending.is_empty() {
+                                if quotes_balanced(line) {
+                                    self.push_line(line, line_end <= self.resume_from_offset)?;
+                                } else {
+                                    pending.extend_from_slice(line);
+                                }
+                            } else {
+                                pending.push(b'\n');
+                                pending.extend_from_slice(line);
+                                if quotes_balanced(&pending) {
+                                    let rec = std::mem::take(&mut pending);
+                                    self.push_line(&rec, line_end <= self.resume_from_offset)?;
+                                }
+                            }
+                        } else {
+                            self.push_line(line, line_end <= self.resume_from_offset)?;
+                        }
                         start = i + 1;
                     }
                 }
@@ -430,11 +542,29 @@ impl<'a> SplitCtx<'a> {
                 if line.last() == Some(&b'\r') {
                     line = &line[..line.len() - 1];
                 }
-                self.push_line(line, ff)?;
+                if multiline && !pending.is_empty() {
+                    // Sisa multiline di EOF: gabung carry sebagai baris terakhir.
+                    pending.push(b'\n');
+                    pending.extend_from_slice(line);
+                    let rec = std::mem::take(&mut pending);
+                    self.push_line(&rec, ff)?;
+                } else if multiline && !quotes_balanced(line) {
+                    // File berakhir di tengah quote: tetap dorong apa adanya
+                    // agar error data jelas di flush (bukan hilang diam-diam).
+                    self.push_line(line, ff)?;
+                } else {
+                    self.push_line(line, ff)?;
+                }
                 if let Some(s) = &self.state {
                     s.input_bytes_read.fetch_add(carry.len() as u64, Ordering::Relaxed);
                 }
             }
+        }
+        // Pending multiline yang tidak pernah balance (EOF): dorong apa adanya.
+        if !pending.is_empty() {
+            let rec = std::mem::take(&mut pending);
+            let ff = self.bytes_before_block <= self.resume_from_offset;
+            self.push_line(&rec, ff)?;
         }
 
         // Flush the final (possibly partial) chunk.
@@ -501,7 +631,7 @@ impl<'a> SplitCtx<'a> {
                 self.total_lines += 1;
             }
             SortFormat::Csv { delimiter, keys, key_numeric } => {
-                let extracted = extract_csv_keys(line, *delimiter, keys, *key_numeric)
+                let extracted = extract_csv_keys(line, *delimiter, keys, *key_numeric, self.opts.ignore_case)
                     .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))?;
                 // Store the raw record; keys are re-extracted (and the record
                 // sorted) at flush time so temp files stay plain newline text.
@@ -511,7 +641,7 @@ impl<'a> SplitCtx<'a> {
                 self.total_lines += 1;
             }
             SortFormat::Jsonl { field, key_numeric } => {
-                let extracted = extract_json_key(line, field, *key_numeric)
+                let extracted = extract_json_key(line, field, *key_numeric, self.opts.ignore_case)
                     .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))?;
                 self.cur_bytes += line.len() + 2 * std::mem::size_of::<String>() + 24;
                 self.cur_csv.push(line.to_vec());
@@ -527,58 +657,74 @@ impl<'a> SplitCtx<'a> {
     fn flush_chunk(&mut self) -> std::io::Result<()> {
         let t0 = Instant::now();
         let rev = self.reverse;
+        let ignore_case = self.opts.ignore_case;
+        // Stable sorts throughout: equal keys keep input order, which makes
+        // dedupe-keep-last deterministic (the *last* input row of each equal
+        // group is well-defined instead of an unstable-sort artifact).
         match self.fmt {
             SortFormat::Numeric => {
                 if rev {
-                    self.cur_nums.par_sort_unstable_by(|a, b| b.cmp(a));
+                    self.cur_nums.par_sort_by(|a, b| b.cmp(a));
                 } else {
-                    self.cur_nums.par_sort_unstable();
+                    self.cur_nums.par_sort();
                 }
             }
             SortFormat::String => {
-                if rev {
-                    self.cur_strings.par_sort_unstable_by(|a, b| b.cmp(a));
+                if ignore_case {
+                    if rev {
+                        self.cur_strings.par_sort_by(|a, b| b.to_lowercase().cmp(&a.to_lowercase()));
+                    } else {
+                        self.cur_strings.par_sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                    }
+                } else if rev {
+                    self.cur_strings.par_sort_by(|a, b| b.cmp(a));
                 } else {
-                    self.cur_strings.par_sort_unstable();
+                    self.cur_strings.par_sort();
                 }
             }
             SortFormat::Csv { .. } | SortFormat::Jsonl { .. } => {} // keys extracted per record below
         }
         // For CSV/JSONL we sort records by their extracted keys now; storing
         // sorted order avoids re-sorting during merge and keeps merge simple.
+        // `&self.fmt` is borrowed (no per-flush Vec clone); keys are
+        // extracted once per record here, not once per comparison.
         if matches!(self.fmt, SortFormat::Csv { .. }) {
-            let delimiter = match &self.fmt {
-                SortFormat::Csv { delimiter, keys, key_numeric } => (*delimiter, keys.clone(), *key_numeric),
+            let (delimiter, keys, key_numeric) = match &self.fmt {
+                SortFormat::Csv { delimiter, keys, key_numeric } => (*delimiter, keys, *key_numeric),
                 _ => unreachable!(),
             };
+            let desc = self.opts.key_desc.clone();
+            let nulls_last = self.opts.nulls_last;
             let mut rows: Vec<(Vec<CsvKey>, Vec<u8>)> = Vec::with_capacity(self.cur_csv.len());
             for rec in self.cur_csv.drain(..) {
-                let k = extract_csv_keys(&rec, delimiter.0, &delimiter.1, delimiter.2)
+                let k = extract_csv_keys(&rec, delimiter, keys, key_numeric, ignore_case)
                     .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))?;
                 rows.push((k, rec));
             }
             if rev {
-                rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                rows.sort_by(|a, b| SortOpts::cmp_keys(&b.0, &a.0, &desc, nulls_last));
             } else {
-                rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                rows.sort_by(|a, b| SortOpts::cmp_keys(&a.0, &b.0, &desc, nulls_last));
             }
             self.cur_csv = rows.into_iter().map(|(_, r)| r).collect();
         }
         if matches!(self.fmt, SortFormat::Jsonl { .. }) {
             let (field, kn) = match &self.fmt {
-                SortFormat::Jsonl { field, key_numeric } => (field.clone(), *key_numeric),
+                SortFormat::Jsonl { field, key_numeric } => (field, *key_numeric),
                 _ => unreachable!(),
             };
+            let desc = self.opts.key_desc.clone();
+            let nulls_last = self.opts.nulls_last;
             let mut rows: Vec<(Vec<CsvKey>, Vec<u8>)> = Vec::with_capacity(self.cur_csv.len());
             for rec in self.cur_csv.drain(..) {
-                let k = extract_json_key(&rec, &field, kn)
+                let k = extract_json_key(&rec, field, kn, ignore_case)
                     .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))?;
                 rows.push((k, rec));
             }
             if rev {
-                rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                rows.sort_by(|a, b| SortOpts::cmp_keys(&b.0, &a.0, &desc, nulls_last));
             } else {
-                rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                rows.sort_by(|a, b| SortOpts::cmp_keys(&a.0, &b.0, &desc, nulls_last));
             }
             self.cur_csv = rows.into_iter().map(|(_, r)| r).collect();
         }

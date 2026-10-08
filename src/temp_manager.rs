@@ -65,22 +65,45 @@ pub fn temp_base(output_path: &Path, temp_dir_override: Option<&Path>) -> PathBu
 }
 
 /// Creates `<base>/.temp_sort/run-<pid>-<nanos>/` and remembers it for cleanup.
+/// Retries up to 3x with a counter suffix on directory collision (same-nanos
+/// concurrent starts): `run-<pid>-<nanos>`, `run-<pid>-<nanos>-1`, `-2`.
 pub fn create_run_dir(output_path: &Path, temp_dir_override: Option<&Path>) -> std::io::Result<PathBuf> {
     let base = temp_base(output_path, temp_dir_override);
     fs::create_dir_all(base.clone())?;
-    let unique = format!("run-{}-{}", std::process::id(), nanos_now());
-    let dir = base.join(Path::new(&unique));
-    fs::create_dir_all(dir.clone())?;
-
-    {
-        let mut guard = run_slot().lock().unwrap();
-        // If an old run dir lingers in the slot (shouldn't happen), remove it first.
-        if let Some(old) = guard.take() {
-            let _ = fs::remove_dir_all(old);
+    let pid = std::process::id();
+    let nanos = nanos_now();
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..3 {
+        let unique = if attempt == 0 {
+            format!("run-{}-{}", pid, nanos)
+        } else {
+            format!("run-{}-{}-{}", pid, nanos, attempt)
+        };
+        let dir = base.join(Path::new(&unique));
+        // `create_dir` (not create_dir_all) fails with AlreadyExists on
+        // collision so the retry actually triggers; any other error aborts.
+        match fs::create_dir(dir.clone()) {
+            Ok(_) => {
+                {
+                    let mut guard = run_slot().lock().unwrap();
+                    // If an old run dir lingers in the slot (shouldn't happen), remove it first.
+                    if let Some(old) = guard.take() {
+                        let _ = fs::remove_dir_all(old);
+                    }
+                    *guard = Some(dir.clone());
+                }
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
         }
-        *guard = Some(dir.clone());
     }
-    Ok(dir)
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::other("create_run_dir: directory collision after 3 attempts")
+    }))
 }
 
 /// Adopts an existing run dir for resume (registered for cleanup, not deleted).
@@ -124,7 +147,26 @@ pub fn cleanup_staging() {
 }
 
 /// Removes the run's entire directory tree after a fully successful run.
+///
+/// Safety guard: only paths inside a `.temp_sort` base whose final component
+/// starts with `run-` are ever deleted. Anything else is refused with a
+/// warning so a caller bug (wrong dir, `/`, CWD) can never `remove_dir_all`
+/// user data.
 pub fn cleanup_run_dir_tree(run_dir: &Path) {
+    let name = run_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let inside_temp_sort = run_dir
+        .components()
+        .any(|c| c.as_os_str() == ".temp_sort");
+    if !inside_temp_sort || !name.starts_with("run-") {
+        eprintln!(
+            "warning: cleanup_run_dir_tree menolak menghapus {} (bukan <...]/.temp_sort/run-* — lewati)",
+            run_dir.display()
+        );
+        return;
+    }
     let _ = fs::remove_dir_all(run_dir);
     let slot_ok = run_slot().lock().map(|mut g| {
         if g.as_deref() == Some(run_dir) {

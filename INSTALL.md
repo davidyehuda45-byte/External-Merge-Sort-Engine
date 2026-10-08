@@ -1,55 +1,68 @@
 # Install — External Merge Sort Engine
 
-## Windows (30 seconds)
+## Windows (30 detik)
+1. Extract ZIP release
+2. Double-click **`Start-GUI.bat`** → browser terbuka di `http://127.0.0.1:8080/`
+3. Klik **Generate demo**, lalu **Urutkan sekarang**, lalu **Download**. Selesai.
 
-1. Extract the release ZIP file.
-2. Double-click **`Start-GUI.bat`**. Your browser will open:
-   `http://127.0.0.1:8080/`
-3. Click **Generate demo**, then **Sort now**, and finally **Download**.
+> `Start-GUI.bat` hanya tersedia di ZIP installer, bukan di repo.
+> Dari repo, build dulu (`cargo build --release`) lalu jalankan
+> `.\target\release\mergesort.exe --gui 127.0.0.1:8080`.
 
-That's it. No complicated setup required.
+### Muncul peringatan biru "Windows protected your PC"?
+Ini normal untuk aplikasi baru yang belum beli sertifikat digital berbayar —
+**bukan tanda virus**. Cara lanjut:
+1. Klik tulisan kecil **"More info"** di dalam kotak peringatan.
+2. Tombol **"Run anyway"** akan muncul di bawahnya — klik itu.
+3. Peringatan ini hanya muncul sekali per file per komputer.
 
-### Seeing the blue "Windows protected your PC" warning?
+Kalau antivirus (Windows Defender/lainnya) mengkarantina file: klik kanan file
+ZIP/exe → **Properties** → centang **"Unblock"** di bagian bawah → OK, lalu
+extract ulang. Ini karena file diunduh dari internet (Windows menandai semua
+file unduhan), bukan karena filenya berbahaya.
 
-This can happen because the application is new and does not have a paid code-signing certificate yet.
+### Catatan build Windows
+Binary release memakai static CRT (`/MT`) agar berjalan tanpa instalasi
+Visual C++ Redistributable tambahan. Build standar `cargo build --release`
+sudah cukup; tidak perlu flag khusus.
 
-**It does not automatically mean the application is a virus.**
-
-To continue:
-
-1. Click **"More info"** in the warning window.
-2. Click **"Run anyway"**.
-3. The warning normally only appears once for each file on each computer.
-
-If Windows Defender or another antivirus program quarantines the file:
-
-1. Right-click the downloaded **ZIP or EXE** file.
-2. Select **Properties**.
-3. Check **"Unblock"** at the bottom of the window.
-4. Click **OK**.
-5. Extract the ZIP file again.
-
-Windows may mark files downloaded from the internet as coming from an external source. This warning by itself does not mean the file is malicious.
-
-## CLI (For Advanced Users)
-
-If you prefer using the command line:
-
-```powershell
-.\mergesort.exe --input data.csv --output sorted.csv --max-memory 1GB --format csv --key-column 0 --key-type numeric --header --verify
+## Linux / macOS (native)
+```bash
+# prasyarat: Rust 1.88+ (edition 2024), lihat https://rustup.rs
+cargo build --release --locked
+./target/release/mergesort --help
+./target/release/mergesort --input data.csv --output sorted.csv --max-memory 1GB --format csv --key-column 0 --key-type numeric --header --verify
+# atau via script:
+./build.sh
 ```
 
-## Important Notes
+## CLI (power user)
+```powershell
+.\mergesort.exe --input data.csv --output sorted.csv --format csv --key-column 0 --key-type numeric --header --verify
+# --max-memory opsional (default 60% RAM); --backup sebelum timpa; --ignore-case/--nulls/--key-dir untuk sort semantik
+```
 
-* The engine works **100% offline** and does not require an internet connection.
-* Do **not** expose `--gui` or `--dashboard` directly to the public internet.
-* For local use, bind them to `127.0.0.1`.
+## Daemon / service (gratis, tanpa MSI)
+- Linux: `sudo cp deploy/mergesort.service /etc/systemd/system/ && sudo systemctl enable --now mergesort` (sesuaikan path di file).
+- Windows: `powershell -ExecutionPolicy Bypass -File deploy/install-watch-task.ps1` (task logon: inbox `%USERPROFILE%\mergesort-inbox`).
+- MSI: roadmap `deploy/MergeSort.wxs` (`wix build`). Signing berbayar: lihat `SIGNING.md`.
+
+## Uninstall
+- Windows ZIP: jalankan `Uninstall.bat` (hapus exe + `%APPDATA%\MergeSort` + `.temp_sort`), lalu hapus folder.
+- Linux/mac: hapus binary + `~/.mergesort` + temp dir (`--temp-dir` bila dipakai).
+
+## Catatan
+- Offline 100%, tidak perlu internet. Jangan expose `--gui`/`--dashboard` ke internet publik (bind `127.0.0.1` saja).
 
 ## Docker
-
-You can also run the engine with Docker:
-
 ```bash
 docker build -t mergesort .
-docker run --rm -v "$PWD:/data" mergesort --input /data/in.csv --output /data/out.csv --max-memory 1GB --format csv --key-column 0 --verify
+docker run --rm -v "$PWD:/data" mergesort --input /data/in.csv --output /data/out.csv --max-memory 1GB --format csv --key-column 0 --key-type numeric --verify
+# dengan live dashboard (port 8080 sudah EXPOSE di image):
+docker run --rm -v "$PWD:/data" -p 8080:8080 mergesort --input /data/in.csv --output /data/out.csv --max-memory 1GB --format csv --key-column 0 --key-type numeric --verify --dashboard 0.0.0.0:8080
 ```
+
+## Uninstall
+1. Hapus folder aplikasi (hasil extract ZIP atau clone repo) — tidak ada entri registry/services.
+2. Hapus data kerja/user jika ada: `%APPDATA%\MergeSort` (Windows) atau `~/.mergesort` (Linux/macOS).
+3. Hapus temp sisa jika ada: `<workdir>/.temp_sort` dan folder `--temp-dir` kustom yang pernah dipakai.

@@ -1,177 +1,46 @@
 # Sales Kit — External Merge Sort Engine
 
-## 30-Second Pitch
+## 30-second pitch
+"Sort file yang lebih besar dari RAM. Teruji 496 MB di laptop 8 GB; arsitektur mendukung hingga 1 TB+ di server dengan disk dan `--temp-dir` yang cukup. CSV per kolom, resume kalau mati lampu, dashboard live, output JSON buat CI. Ada GUI buat staf non-teknis."
 
-> **"Sort files that are larger than your available RAM. Handle 2GB files on an 8GB laptop, and 1TB+ files on servers. Sort CSV files by column, resume interrupted jobs, monitor progress with a live dashboard, and export JSON for CI. There is also a simple GUI for non-technical staff."**
+## Demo script (5 menit, bikin klien ngangguk)
+1. `Start-GUI.bat` (dari ZIP installer) → Generate demo 10k → Urutkan sekarang → Download (30 detik, tanpa CLI).
+2. CLI power: `--dry-run` dulu (estimasi gratis), lalu sort 200k rows + `--verify` + `--json`.
+3. Matikan paksa (Ctrl-C) di tengah jalan → `--resume list` → `--resume` → "tidak ada kerja yang hilang".
+4. Tunjukkan `--reverse --unique --header --limit 1000` (Top-N) — fitur yang GNU sort pun ribet untuk file raksasa.
+5. Tutup: "audit tiap run ke `--log-file audit.jsonl`."
 
----
+## Pricing suggestion (contoh range, final hubungi kami)
+- Personal: contoh Rp500rb sekali bayar (build standar + installer ZIP).
+- Tim: contoh Rp2jt (preset, white-label dasar, dukungan email 30 hari).
+- Enterprise: SLA + custom (S3, gzip, GUI branding, installer MSI) — harga custom, hubungi kami.
+> Angka di atas contoh awal untuk diskusi — harga final tergantung scope. Jika tidak ingin angka, cukup tulis "hubungi kami untuk penawaran".
 
-## 5-Minute Demo
+## Objection handling
+- "Kenapa tidak pakai GNU sort?" → GNU sort tidak punya resume, dashboard, JSON, Top-N streaming, pre-flight disk check, dan makan RAM tak terbatas.
+- "Kenapa tidak Python pandas?" → pandas butuh RAM > file. Ini bounded `--max-memory`.
+- "Data sensitif?" → 100% offline, single binary, temp dibersihkan otomatis, atomic output (tidak pernah setengah-jadi).
+- "Apakah .zip/.gz perlu extract manual?" → Tidak untuk `.gz`/`.zip` (transparan, streaming); `.zst` ditolak dengan pesan jelas — convert dulu ke `.gz`/`.zip`/plain.
 
-### 1. Start with the GUI
+## What's inside
+- Formats: numeric binary u64, string, CSV multi-key (maks 4 kolom, contoh `--multi-key "0,2" --key-type numeric`), JSONL, Excel, header, reverse, unique, limit.
+- Kompresi: `.gz`/`.zip` transparan; `.zst` ditolak dengan panduan.
+- Safety: exit codes 0-6 (+ `--force` untuk timpa, tolak `input==output`), pre-flight disk, `.part` + rename, `--verify` order + row-count.
+- Ops: `--gui` (Cancel + Preview + Browse server), `--api` (`/api/cancel`, `/api/preview`, `/api/files`, token), `--watch`, `--dashboard`, `--json`, `--log-file`, `--temp-dir`, `--resume`, `--merge`, `--split-by`, Docker.
 
-Run:
+## FAQ
+- 1GB berapa lama? Acuan SSD ~120MB/mnt single-thread; `--dry-run` beri estimasi + `--temp-dir` di SSD tercepat.
+- RAM berapa? `--max-memory 50-70% RAM`; 496MB teruji di 512MB budget (RSS 464MB).
+- Mati lampu? `--resume list` / `--resume`; GUI: job tertinggal bisa rerun via Riwayat; job running bisa Cancel.
+- Data sensitif? 100% offline, jail path cwd/uploads/temp, token API, audit JSONL, `Uninstall.bat` bersihkan `%APPDATA%\MergeSort`.
+- Garansi? Lihat LICENSE MIT + penawaran SLA Enterprise.
 
-```text
-Start-GUI.bat
-```
-
-Then:
-
-```text
-Generate demo 10k
-→ Sort Now
-→ Download
-```
-
-No command line required.
-
-### 2. Show the Developer Workflow
-
-Run `--dry-run` first to get a free estimate.
-
-Then sort 200k rows using:
-
-```text
---verify --json
-```
-
-Show the processing information and verification result.
-
-### 3. Test Crash Recovery
-
-Stop the process with `Ctrl-C` while it is running.
-
-Then run:
-
-```text
---resume list
-```
-
-and:
-
-```text
---resume
-```
-
-The engine continues from the completed work instead of starting everything from the beginning.
-
-### 4. Show Advanced Sorting
-
-Demonstrate:
-
-```text
---reverse --unique --header --limit 1000
-```
-
-This can sort in reverse order, remove duplicates, preserve headers, and return only the first 1,000 results.
-
-### 5. Finish with the Audit Log
-
-Every run can be recorded using:
-
-```text
---log-file audit.jsonl
-```
-
-This gives you a machine-readable history of sorting jobs.
-
----
-
-# Pricing
-
-The engine is offered using a **custom development/service model**.
-
-### Personal / Team
-
-Custom builds based on your requirements.
-
-### Enterprise
-
-Custom solutions can include:
-
-* SLA
-* S3 integration
-* Gzip support
-* Custom GUI branding
-* MSI installer
-* Other enterprise-specific requirements
-
----
-
-# Common Questions
-
-### "Why not just use GNU sort?"
-
-GNU `sort` is a powerful tool, but this engine adds features designed for larger and more controlled workflows, including:
-
-* Resume support
-* Live dashboard
-* JSON output
-* Top-N processing
-* Pre-flight disk-space checks
-* Controlled memory usage
-
-### "Why not use Python pandas?"
-
-For datasets larger than available RAM, pandas may require significant memory.
-
-External Merge Sort Engine uses a configurable memory limit:
-
-```text
---max-memory
-```
-
-This allows the sorting process to operate within a defined memory budget.
-
-### "What about sensitive data?"
-
-The engine is designed to run **100% offline**.
-
-* Data stays on your machine or server.
-* Distributed as a single binary.
-* Temporary files are cleaned up automatically.
-* Output is written safely using `.part` files and atomic rename.
-* `--verify` can check the final result.
-
-No cloud upload is required.
-
----
-
-# What's Included
-
-## Data Formats
-
-* Binary numeric `u64`
-* String
-* CSV
-* CSV multi-key sorting, up to 4 columns
-* JSONL
-* Excel
-* Header support
-* Reverse sorting
-* Duplicate removal
-* Top-N results
-
-## Safety
-
-* Exit codes `0-6`
-* Pre-flight disk-space checks
-* `.part` temporary output + atomic rename
-* `--verify`
-* Order verification
-* Row-count verification
-
-## Operations
-
-* `--gui`
-* `--api`
-* `--watch`
-* `--dashboard`
-* `--json`
-* `--log-file`
-* `--temp-dir`
-* `--resume`
-* `--merge`
-* `--split-by`
-* Docker support
+## Perbandingan
+| | MergeSort Pro | GNU sort | pandas |
+|---|---|---|---|
+| >RAM bounded | ya (`--max-memory`) | tidak (RAM tak terbatas) | tidak (butuh RAM>file) |
+| Resume | ya | tidak | tidak |
+| Dashboard/GUI/Cancel/Preview | ya | tidak | notebook saja |
+| JSON CI + exit 0-6 | ya | tidak | manual |
+| Top-N streaming (`--limit`) | ya | ribet file raksasa | OOM |
+| Pre-flight disk | ya | tidak | tidak |

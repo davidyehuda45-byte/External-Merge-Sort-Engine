@@ -73,10 +73,16 @@ struct Config {
     brand: Option<String>,
     brand_color: Option<String>,
     sheet: Option<String>,
+    force: bool,
+    backup: bool,
+    split_by_size: Option<u64>,
+    ignore_case: bool,
+    nulls_last: bool,
+    key_dir: Option<String>,
 }
 
 fn usage() -> String {
-    "usage: mergesort --input <path> --output <path> --max-memory <size> [options]
+    "usage: mergesort --input <path> --output <path> [--max-memory <size>] [options]
    or: mergesort --gui [host:]PORT   (web console, drag-drop, no CLI needed)
 
 data format:
@@ -93,6 +99,11 @@ data format:
   --output-format F            convert on write: csv|tsv|jsonl|sql (+ --sql-table)
   --sql-table T                table name for --output-format sql
   --split-by N                 split output into N equal files (out-001.ext...)
+  --split-by-size SIZE         split output by size (mis. 100MB, header diulang)
+  --backup                     sebelum timpa output, salin yang lama ke <output>.bak
+  --ignore-case                bandingkan string tanpa bedakan huruf besar/kecil
+  --nulls last|first           baris dengan key kosong di akhir/awal (default: awal)
+  --key-dir DIRS               arah per-key sejajar multi-key, mis. \"asc,desc\" (default semua asc)
   --sheet NAME                 xlsx sheet to read (default: first sheet)
   --header                     keep first line (CSV/string) as header, not sorted
   --no-header                  force no header (override auto-detect)
@@ -113,6 +124,7 @@ robustness:
   --temp-dir <path>            put temp chunk files on another drive
   --resume [run_id|list]       continue an interrupted run (no id = newest)
   --verify                     re-read output and check ordering
+  --force                      allow overwrite output/part files (skip confirm)
 
 planning:
   --dry-run                    estimate disk/memory/chunks and exit (no sorting)
@@ -133,12 +145,22 @@ observability:
   --watch DIR                  daemon: auto-sort file baru di folder (+ --output-dir)
   --output-dir DIR             target folder untuk --watch
   --version, -V                print version and exit
-  --help, -h                   print this help"
+  --help, -h                   print this help
+
+shell:
+  --completion SHELL           print static completion script (bash|powershell|fish)
+  env fallback (bila flag absen): MERGESORT_MAX_MEMORY (mis. 512MB),
+    MERGESORT_TEMP_DIR (pengganti --temp-dir)"
         .to_string()
 }
 
-/// Parses a size like "100MB", "1gb", "4096" into bytes.
+/// Parses a size like "100MB", "1gb", "1.5gb", "4096" into bytes.
+///
+/// Tanpa float: bagian integer + desimal dihitung eksak dengan u128
+/// (`total = int*mult + frac*mult/10^len`), overflow ditolak dengan error
+/// (bukan wrap/saturate diam-diam). Suffix kb/mb/gb/k/m/g case-insensitive.
 fn parse_size(s: &str) -> Result<u64, String> {
+    let invalid = || format!("ukuran tidak valid: '{}'", s);
     let t = s.trim().to_lowercase();
     let (num, mult): (&str, u64) = if let Some(x) = t.strip_suffix("gb") {
         (x, 1024 * 1024 * 1024)
@@ -155,14 +177,46 @@ fn parse_size(s: &str) -> Result<u64, String> {
     } else {
         (t.as_str(), 1)
     };
-    let n: f64 = num
-        .trim()
-        .parse()
-        .map_err(|_| format!("ukuran tidak valid: '{}'", s))?;
-    if n < 0.0 {
-        return Err(format!("ukuran tidak valid: '{}'", s));
+    let num = num.trim();
+    if num.is_empty() || num.starts_with('-') || num.starts_with('+') {
+        return Err(invalid());
     }
-    Ok((n * mult as f64) as u64)
+    // Pisah integer + desimal; lebih dari satu titik ditolak.
+    let mut parts = num.split('.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        return Err(invalid());
+    }
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err(invalid());
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    let int_val: u128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse::<u128>().map_err(|_| invalid())?
+    };
+    let frac_val: u128 = if frac_part.is_empty() {
+        0
+    } else {
+        frac_part.parse::<u128>().map_err(|_| invalid())?
+    };
+    let scale: u128 = 10u128.checked_pow(frac_part.len() as u32).ok_or_else(invalid)?;
+    // Pembulatan ke bawah; sisa < 1 byte tidak bermakna untuk --max-memory.
+    let total = int_val
+        .checked_mul(mult as u128)
+        .and_then(|base| {
+            frac_val
+                .checked_mul(mult as u128)
+                .and_then(|f| f.checked_div(scale).and_then(|add| base.checked_add(add)))
+        })
+        .ok_or_else(invalid)?;
+    u64::try_from(total).map_err(|_| invalid())
 }
 
 fn parse_delimiter(s: &str) -> Result<u8, String> {
@@ -178,6 +232,71 @@ fn parse_delimiter(s: &str) -> Result<u8, String> {
             }
         }
     }
+}
+
+/// Peringatkan flag sort yang ikut diberikan tapi diabaikan oleh mode
+/// server/wizard/daemon (--gui/--api/--interactive/--watch). Sebelumnya
+/// flag tersebut dibuang diam-diam (early-return tanpa pesan).
+fn warn_ignored_sort_flags(args: &[String], mode: &str) {
+    const SORT_FLAGS: &[&str] = &[
+        "--input", "--output", "--max-memory", "--mode", "--format", "--key-column",
+        "--multi-key", "--key-type", "--key-field", "--delimiter", "--verify",
+        "--reverse", "-r", "--unique", "-u", "--header", "--no-header", "--limit",
+        "--split-by", "--split-by-size", "--backup", "--ignore-case", "--nulls", "--key-dir", "--output-format", "--sql-table", "--resume", "--dry-run",
+        "--check", "--preview", "--preview-json", "--stats", "--stats-json",
+        "--temp-dir", "--threads", "--merge", "--dedupe-by", "--dedupe-keep",
+        "--sheet", "--encoding", "--encoding-in", "--encoding-out", "--force",
+        "--max-open-files", "--quiet", "--json", "--log-file", "--dashboard",
+    ];
+    let mut seen: Vec<&str> = Vec::new();
+    for a in args {
+        if SORT_FLAGS.contains(&a.as_str()) && !seen.contains(&a.as_str()) {
+            seen.push(a.as_str());
+        }
+    }
+    if !seen.is_empty() {
+        eprintln!(
+            "peringatan: {} mengabaikan flag sort berikut: {} (mode ini tidak me-sort)",
+            mode,
+            seen.join(", ")
+        );
+    }
+}
+
+const BASH_COMPLETION: &str = r#"# mergesort bash completion (stub): source this file or drop in /etc/bash_completion.d/
+_complete_mergesort() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local flags="--input --output --max-memory --mode --format --delimiter --key-column --multi-key --key-type --key-field --dedupe-by --dedupe-keep --merge --output-format --sql-table --split-by --split-by-size --backup --ignore-case --nulls --key-dir --sheet --header --no-header --reverse --unique --limit --preview --preview-json --stats --stats-json --check --encoding --encoding-in --encoding-out --temp-dir --resume --verify --dry-run --max-open-files --threads --quiet --json --log-file --dashboard --gui --api --api-token --brand --brand-color --interactive --watch --output-dir --force --completion --help --version"
+    COMPREPLY=($(compgen -W "$flags" -- "$cur"))
+}
+complete -F _complete_mergesort mergesort
+"#;
+
+const FISH_COMPLETION: &str = r#"# mergesort fish completion (stub): save as ~/.config/fish/completions/mergesort.fish
+for f in --input --output --max-memory --mode --format --delimiter --key-column --multi-key --key-type --key-field --dedupe-by --dedupe-keep --merge --output-format --sql-table --split-by --split-by-size --backup --ignore-case --nulls --key-dir --sheet --header --no-header --reverse --unique --limit --preview --preview-json --stats --stats-json --check --encoding --encoding-in --encoding-out --temp-dir --resume --verify --dry-run --max-open-files --threads --quiet --json --log-file --dashboard --gui --api --api-token --brand --brand-color --interactive --watch --output-dir --force --completion --help --version
+    complete -c mergesort -l (string replace -r '^--' '' -- $f)
+end
+"#;
+
+const POWERSHELL_COMPLETION: &str = r#"# mergesort powershell completion (stub): dot-source this file from $PROFILE
+Register-ArgumentCompleter -Native -CommandName mergesort -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $flags = @('--input','--output','--max-memory','--mode','--format','--delimiter','--key-column','--multi-key','--key-type','--key-field','--dedupe-by','--dedupe-keep','--merge','--output-format','--sql-table','--split-by','--sheet','--header','--no-header','--reverse','--unique','--limit','--preview','--preview-json','--stats','--stats-json','--check','--encoding','--encoding-in','--encoding-out','--temp-dir','--resume','--verify','--dry-run','--max-open-files','--threads','--quiet','--json','--log-file','--dashboard','--gui','--api','--api-token','--brand','--brand-color','--interactive','--watch','--output-dir','--force','--completion','--help','--version')
+    $flags | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_)
+    }
+}
+"#;
+
+/// Stub shell completion: cetak script statis untuk bash|powershell|fish.
+fn print_completion(shell: &str) -> Result<(), String> {
+    match shell.to_lowercase().as_str() {
+        "bash" => println!("{}", BASH_COMPLETION),
+        "fish" => println!("{}", FISH_COMPLETION),
+        "powershell" => println!("{}", POWERSHELL_COMPLETION),
+        other => return Err(format!("--completion harus bash|powershell|fish, dapat '{}'", other)),
+    }
+    Ok(())
 }
 
 /// Consumes the CSV sub-flags (--key-column/--multi-key/--key-type) that
@@ -295,6 +414,13 @@ fn parse_args() -> Result<Config, String> {
     let mut brand: Option<String> = None;
     let mut brand_color: Option<String> = None;
     let mut sheet: Option<String> = None;
+    let mut force = false;
+    let mut backup = false;
+    let mut split_by_size: Option<u64> = None;
+    let mut ignore_case = false;
+    let mut nulls_last = false;
+    let mut nulls_flag: Option<String> = None;
+    let mut key_dir: Option<String> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -418,6 +544,19 @@ fn parse_args() -> Result<Config, String> {
                 );
             }
             "--verify" => do_verify = true,
+            "--force" => force = true,
+            "--completion" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "--completion butuh nilai bash|powershell|fish".to_string())?
+                    .clone();
+                print_completion(&v)?;
+                std::process::exit(errors::OK);
+            }
+            "--config" => {
+                return Err("--config belum didukung (config file TOML terlalu berat untuk CLI ini) — pakai env MERGESORT_MAX_MEMORY / MERGESORT_TEMP_DIR sebagai gantinya".to_string());
+            }
             "--reverse" | "-r" => reverse = true,
             "--unique" | "-u" => unique = true,
             "--header" => {
@@ -572,6 +711,30 @@ fn parse_args() -> Result<Config, String> {
                 }
                 split_by = Some(n);
             }
+            "--split-by-size" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| "--split-by-size butuh nilai (mis. 100MB)".to_string())?;
+                let b = parse_size(v)?;
+                if b < 1024 {
+                    return Err("--split-by-size minimal 1KB".to_string());
+                }
+                split_by_size = Some(b);
+            }
+            "--backup" => backup = true,
+            "--ignore-case" => ignore_case = true,
+            "--nulls" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| "--nulls butuh nilai first|last".to_string())?;
+                match v.as_str() {
+                    "first" | "last" => nulls_flag = Some(v.clone()),
+                    _ => return Err(format!("--nulls harus first|last, dapat '{}'", v)),
+                }
+            }
+            "--key-dir" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| "--key-dir butuh nilai mis. \"asc,desc\"".to_string())?;
+                key_dir = Some(v.clone());
+            }
             "--interactive" => interactive = true,
             "--watch" => {
                 i += 1;
@@ -633,8 +796,25 @@ fn parse_args() -> Result<Config, String> {
         i += 1;
     }
 
+    // Env fallback (tanpa file config): MERGESORT_MAX_MEMORY / MERGESORT_TEMP_DIR
+    // dipakai hanya bila flag setara absen. Lihat --help bagian shell.
+    if max_memory.is_none()
+        && let Ok(ev) = std::env::var("MERGESORT_MAX_MEMORY")
+        && !ev.trim().is_empty() {
+            max_memory = Some(
+                parse_size(&ev)
+                    .map_err(|e| format!("env MERGESORT_MAX_MEMORY tidak valid: {}", e))?,
+            );
+        }
+    if temp_dir.is_none()
+        && let Ok(ev) = std::env::var("MERGESORT_TEMP_DIR")
+        && !ev.trim().is_empty() {
+            temp_dir = Some(PathBuf::from(ev));
+        }
+
     // Alternate server modes don't need input/output/memory.
     if gui.is_some() || api.is_some() {
+        warn_ignored_sort_flags(&args, "--gui/--api");
         return Ok(Config {
             input: input.unwrap_or_else(|| PathBuf::from("")),
             output: output.unwrap_or_else(|| PathBuf::from("")),
@@ -672,6 +852,7 @@ fn parse_args() -> Result<Config, String> {
             output_format,
             sql_table,
             split_by,
+            split_by_size,
             interactive: false,
             watch: watch.map(PathBuf::from),
             output_dir: output_dir.map(PathBuf::from),
@@ -680,10 +861,16 @@ fn parse_args() -> Result<Config, String> {
             brand,
             brand_color,
             sheet: None,
+            force,
+            backup,
+            ignore_case,
+            nulls_last,
+            key_dir,
         });
     }
     // --interactive / --watch resolve their own inputs at runtime.
     if interactive || watch.is_some() {
+        warn_ignored_sort_flags(&args, if interactive { "--interactive" } else { "--watch" });
         return Ok(Config {
             input: input.unwrap_or_else(|| PathBuf::from("")),
             output: output.unwrap_or_else(|| PathBuf::from("")),
@@ -721,6 +908,7 @@ fn parse_args() -> Result<Config, String> {
             output_format,
             sql_table,
             split_by,
+            split_by_size,
             interactive,
             watch: watch.map(PathBuf::from),
             output_dir: output_dir.map(PathBuf::from),
@@ -729,16 +917,21 @@ fn parse_args() -> Result<Config, String> {
             brand,
             brand_color,
             sheet: None,
+            force,
+            backup,
+            ignore_case,
+            nulls_last,
+            key_dir,
         });
     }
-    // --merge mode: inputs = pre-sorted files, needs --output + --max-memory.
+    // --merge mode: inputs = pre-sorted files, needs --output (+ --max-memory opsional).
     let is_merge = !merge_inputs.is_empty();
     if is_merge {
         if input.is_some() {
             return Err("--merge tidak bisa digabung dengan --input".to_string());
         }
-        if output.is_none() || max_memory.is_none() {
-            return Err("--merge butuh --output dan --max-memory".to_string());
+        if output.is_none() {
+            return Err("--merge butuh --output".to_string());
         }
         if resume.is_some() {
             return Err("--merge tidak mendukung --resume".to_string());
@@ -757,20 +950,29 @@ fn parse_args() -> Result<Config, String> {
             return Err("flag wajib belum lengkap (butuh --input untuk --check)".to_string());
         }
         if max_memory.is_none() {
-            max_memory = Some(512 * 1024 * 1024);
+            max_memory = Some(default_max_memory());
         }
         if output.is_none() {
             output = Some(PathBuf::from(""));
         }
     } else if is_preview {
-        if input.is_none() || max_memory.is_none() {
-            return Err("flag wajib belum lengkap (butuh --input, --max-memory untuk --preview; --output opsional)".to_string());
+        if input.is_none() {
+            return Err("flag wajib belum lengkap (butuh --input untuk --preview; --output opsional)".to_string());
+        }
+        if max_memory.is_none() {
+            max_memory = Some(default_max_memory());
         }
         if output.is_none() {
             output = Some(PathBuf::from(""));
         }
-    } else if !is_merge && (input.is_none() || output.is_none() || max_memory.is_none()) {
-        return Err("flag wajib belum lengkap (butuh --input, --output, --max-memory) atau gunakan --gui/--check/--preview/--merge".to_string());
+    } else if !is_merge && (input.is_none() || output.is_none()) {
+        return Err("flag wajib belum lengkap (butuh --input, --output) atau gunakan --gui/--check/--preview/--merge".to_string());
+    }
+    // --max-memory opsional: default 60% RAM agar pemula tidak wajib hafal flag.
+    if max_memory.is_none() {
+        let d = default_max_memory();
+        eprintln!("info: --max-memory tidak diberikan, pakai default 60% RAM ({}).", disk::human_size(d));
+        max_memory = Some(d);
     }
     // Empty CSV keys (e.g. bare --mode excel without --key-column).
     if let SortFormat::Csv { keys, .. } = &fmt
@@ -832,8 +1034,36 @@ fn parse_args() -> Result<Config, String> {
     if split_by.is_some() && is_preview {
         return Err("--split-by tidak bisa digabung dengan --preview".to_string());
     }
+    if split_by_size.is_some() && is_preview {
+        return Err("--split-by-size tidak bisa digabung dengan --preview".to_string());
+    }
+    if split_by.is_some() && split_by_size.is_some() {
+        return Err("--split-by dan --split-by-size tidak bisa digabung".to_string());
+    }
     if output_format.as_deref() == Some("sql") && !matches!(fmt, SortFormat::Csv { .. }) {
         return Err("--output-format sql butuh input --format csv (header jadi nama kolom)".to_string());
+    }
+    if key_dir.is_some() && !matches!(fmt, SortFormat::Csv { .. }) {
+        return Err("--key-dir hanya berlaku dengan --format csv / --mode excel".to_string());
+    }
+    if let Some(kd) = &key_dir {
+        let n_keys = match &fmt {
+            SortFormat::Csv { keys, .. } => keys.len(),
+            _ => 0,
+        };
+        let parts: Vec<&str> = kd.split(',').collect();
+        if parts.len() != n_keys {
+            return Err(format!("--key-dir butuh {} arah sejajar keys (dapat {})", n_keys, parts.len()));
+        }
+        for p in &parts {
+            match p.trim().to_lowercase().as_str() {
+                "asc" | "desc" => {}
+                _ => return Err(format!("--key-dir hanya asc|desc, dapat '{}'", p)),
+            }
+        }
+    }
+    if nulls_flag.as_deref() == Some("last") {
+        nulls_last = true;
     }
     Ok(Config {
         input: input.unwrap_or_else(|| PathBuf::from("")),
@@ -872,6 +1102,7 @@ fn parse_args() -> Result<Config, String> {
         output_format,
         sql_table,
         split_by,
+        split_by_size,
         interactive,
         watch: watch.map(PathBuf::from),
         output_dir: output_dir.map(PathBuf::from),
@@ -880,7 +1111,35 @@ fn parse_args() -> Result<Config, String> {
         brand,
         brand_color,
         sheet,
+        force,
+        backup,
+        ignore_case,
+        nulls_last,
+        key_dir,
     })
+}
+
+/// SortOpts gratis dari Config: key_desc sejajar keys dari --key-dir.
+fn sort_opts(cfg: &Config) -> chunk::SortOpts {
+    let key_desc = match &cfg.key_dir {
+        Some(kd) => kd.split(',').map(|p| p.trim().eq_ignore_ascii_case("desc")).collect(),
+        None => Vec::new(),
+    };
+    chunk::SortOpts { ignore_case: cfg.ignore_case, nulls_last: cfg.nulls_last, key_desc }
+}
+
+/// Default --max-memory bila flag absen: 60% total RAM (via sysinfo),
+/// fallback 512MB bila deteksi gagal. Membuat CLI ramah pemula tanpa
+/// mengorbankan klaim bounded-memory (tetap ada batas eksplisit).
+fn default_max_memory() -> u64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let total = sys.total_memory();
+    if total > 0 {
+        (total * 60 / 100).max(64 * 1024 * 1024)
+    } else {
+        512 * 1024 * 1024
+    }
 }
 
 /// Best-effort open-file limit detection. Falls back to a conservative default.
@@ -941,13 +1200,101 @@ fn stage_output_part(output: &Path) -> Result<PathBuf, String> {
 }
 
 /// Durably flushes and atomically renames the staged output over the final path.
+/// Fallback copy (beda volume): staged .part HANYA dihapus setelah copy sukses
+/// (jangan dihapus saat copy berjalan; jangan pula dibiarkan sebagai sampah).
 fn finalize_output(staged: &Path, final_path: &Path) -> std::io::Result<()> {
     if let Ok(f) = std::fs::File::open(staged) {
         f.sync_all().ok();
     }
-    std::fs::rename(staged, final_path)
-        .or_else(|_| std::fs::copy(staged, final_path).map(|_| ()))?;
+    if std::fs::rename(staged, final_path).is_err() {
+        std::fs::copy(staged, final_path)?;
+        std::fs::remove_file(staged).ok();
+    }
     Ok(())
+}
+
+/// true bila dua path menunjuk file yang sama (canonicalize compare).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Tolak --input == --output (canonicalize compare, exit 2/USAGE).
+/// Output kosong ("") berarti preview tanpa commit: tidak ada yang dijaga.
+fn guard_input_output(input: &Path, output: &Path) {
+    if output.as_os_str().is_empty() {
+        return;
+    }
+    if same_file(input, output) {
+        errors::fail(
+            errors::USAGE,
+            &format!(
+                "--input dan --output menunjuk file yang sama ({}); pilih output berbeda",
+                input.display()
+            ),
+        );
+    }
+}
+
+/// Tolak menimpa output yang sudah ada tanpa --force/--backup: cek exists + prompt
+/// bila stdin interaktif, error (minta --force) bila tidak.
+/// Bila `backup` true dan output ada, salin ke <output>.bak dulu lalu izinkan timpa.
+fn guard_output_overwrite(output: &Path, force: bool, backup: bool) {
+    if output.as_os_str().is_empty() || !output.exists() {
+        return;
+    }
+    if backup {
+        let target = PathBuf::from(format!("{}.bak", output.display()));
+        match std::fs::copy(output, &target) {
+            Ok(_) => {
+                eprintln!("info: output lama dibackup ke {}", target.display());
+                return;
+            }
+            Err(e) => errors::fail(errors::IO, &format!("backup gagal {} -> {}: {}", output.display(), target.display(), e)),
+        }
+    }
+    if force {
+        return;
+    }
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        use std::io::Write;
+        eprint!("output {} sudah ada — timpa? [y/N] ", output.display());
+        let _ = std::io::stderr().flush();
+        let mut ans = String::new();
+        if std::io::BufRead::read_line(&mut std::io::BufReader::new(std::io::stdin()), &mut ans).is_ok()
+            && ans.trim().eq_ignore_ascii_case("y")
+        {
+            return;
+        }
+        errors::fail(errors::USAGE, "dibatalkan: output sudah ada (pakai --force untuk menimpa)");
+    } else {
+        errors::fail(
+            errors::USAGE,
+            &format!(
+                "output {} sudah ada — tolak menimpa tanpa --force (non-interaktif)",
+                output.display()
+            ),
+        );
+    }
+}
+
+// Catatan pembatalan (Ctrl-C): tanpa dependency baru (tanpa crate ctrlc /
+// signal-hook) kita tidak memasang handler SIGINT; interupsi menghentikan
+// proses secara default dan direktori run parsial tetap ada untuk --resume
+// berikutnya. Temp staging (.part) dibersihkan lewat panic hook + fail()
+// (setara Drop global: errors::fail selalu memanggil cleanup_staging dulu,
+// dan path sukses membersihkan run dir secara eksplisit). I/O yang
+// mengembalikan ErrorKind::Interrupted diberi petunjuk resume di bawah.
+fn io_fail(code: i32, ctx: &str, e: &std::io::Error) -> ! {
+    if e.kind() == std::io::ErrorKind::Interrupted {
+        eprintln!(
+            "interupsi (Ctrl-C/sinyal) saat {} — file temp aman, lanjutkan dengan --resume",
+            ctx
+        );
+    }
+    errors::fail(code, &format!("{}: {}", ctx, errors::io_hint(e)));
 }
 
 /// Reads the first line (header) as raw bytes, without the trailing newline.
@@ -1035,6 +1382,87 @@ fn truncate_to_limit(staged: &Path, fmt: &SortFormat, n: usize, has_header: bool
     Ok(())
 }
 
+/// Parser CSV/delimited minimal yang quoted-aware: `"a,b"` satu field,
+/// `""` di dalam quotes = satu `"`. Delimiter di dalam quotes tidak memisah.
+fn split_delimited_quoted(line: &str, delim: char) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_q = false;
+    while let Some(c) = chars.next() {
+        if in_q {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    cur.push('"');
+                    chars.next();
+                } else {
+                    in_q = false;
+                }
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' {
+            in_q = true;
+        } else if c == delim {
+            fields.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    fields.push(cur);
+    fields
+}
+
+/// Ganti delimiter jadi TAB hanya di luar quotes (isi `"a,b"` tidak rusak).
+fn tsv_outside_quotes(line: &str, delim: char) -> String {
+    let mut out = String::with_capacity(line.len() + 8);
+    let mut chars = line.chars().peekable();
+    let mut in_q = false;
+    while let Some(c) = chars.next() {
+        if in_q {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    out.push('"');
+                    out.push('"');
+                    chars.next();
+                } else {
+                    out.push('"');
+                    in_q = false;
+                }
+            } else {
+                out.push(c);
+            }
+        } else if c == '"' {
+            in_q = true;
+            out.push('"');
+        } else if c == delim {
+            out.push('\t');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Escape JSON string lengkap: \" \\ \n \r \t \b \f + \u00XX untuk kontrol lain.
+fn json_field_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Converts a sorted CSV output file to tsv|jsonl|sql|csv (streaming).
 /// `sql_table` defaults to "data". JSONL/SQL need column names: from the
 /// header row when present, else col0/col1/...
@@ -1079,10 +1507,13 @@ fn convert_output_format(
         if first && has_header {
             first = false;
             let h = String::from_utf8_lossy(rec).into_owned();
-            col_names = h.split(delim as char).map(|s| s.trim().to_string()).collect();
+            col_names = split_delimited_quoted(&h, delim as char)
+                .iter()
+                .map(|s| s.trim().to_string())
+                .collect();
             match to {
                 "csv" | "tsv" => {
-                    let out_line = if to == "tsv" { h.replace(delim as char, "\t") } else { h };
+                    let out_line = if to == "tsv" { tsv_outside_quotes(&h, delim as char) } else { h };
                     wout.write_all(out_line.as_bytes()).map_err(|e| e.to_string())?;
                     wout.write_all(b"\n").map_err(|e| e.to_string())?;
                 }
@@ -1093,7 +1524,7 @@ fn convert_output_format(
         }
         first = false;
         let s = String::from_utf8_lossy(rec).into_owned();
-        let fields: Vec<&str> = s.split(delim as char).collect();
+        let fields: Vec<String> = split_delimited_quoted(&s, delim as char);
         if col_names.is_empty() {
             col_names = (0..fields.len()).map(|i| format!("col{}", i)).collect();
         }
@@ -1103,7 +1534,7 @@ fn convert_output_format(
                 wout.write_all(b"\n").map_err(|e| e.to_string())?;
             }
             "tsv" => {
-                wout.write_all(s.replace(delim as char, "\t").as_bytes()).map_err(|e| e.to_string())?;
+                wout.write_all(tsv_outside_quotes(&s, delim as char).as_bytes()).map_err(|e| e.to_string())?;
                 wout.write_all(b"\n").map_err(|e| e.to_string())?;
             }
             "jsonl" => {
@@ -1113,9 +1544,9 @@ fn convert_output_format(
                         obj.push(',');
                     }
                     obj.push('"');
-                    obj.push_str(&c.replace('"', "\\\""));
+                    obj.push_str(&json_field_escape(c));
                     obj.push_str("\":\"");
-                    obj.push_str(&f.replace('\\', "\\\\").replace('"', "\\\""));
+                    obj.push_str(&json_field_escape(f));
                     obj.push('"');
                 }
                 obj.push('}');
@@ -1123,6 +1554,7 @@ fn convert_output_format(
                 wout.write_all(b"\n").map_err(|e| e.to_string())?;
             }
             "sql" => {
+                // Nilai SQL: kutip tunggal di-escape jadi '' (bukan backslash).
                 let cols = col_names.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
                 let vals = fields.iter().map(|f| format!("'{}'", f.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
                 let stmt = format!("INSERT INTO \"{}\" ({}) VALUES ({});\n", table.replace('"', "\"\""), cols, vals);
@@ -1139,15 +1571,59 @@ fn convert_output_format(
 
 /// Splits a final output file into N equal files (header repeated per part).
 /// Returns created part paths: `<stem>-001.<ext>`, ... Numeric binary splits by records.
-fn split_output_by_count(output: &Path, n: usize, has_header: bool) -> std::io::Result<Vec<PathBuf>> {
-    use std::io::{BufRead, BufReader, BufWriter, Write};
+/// Part yang sudah ada ditolak (AlreadyExists) kecuali `force` (--force).
+fn split_output_by_count(output: &Path, n: usize, has_header: bool, force: bool) -> std::io::Result<Vec<PathBuf>> {
+    use std::io::{BufRead, BufReader, BufWriter, Read, Write};
     let stem = output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "out".to_string());
     let ext = output.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let parent = output.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    let part_path = |idx: usize| parent.join(format!("{}-{:03}{}", stem, idx + 1, ext));
+    // Cek overwrite dulu sebelum menulis apa pun (berlaku untuk .bin dan teks).
+    if !force {
+        for idx in 0..n {
+            let p = part_path(idx);
+            if p.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("file part sudah ada: {} (pakai --force untuk menimpa)", p.display()),
+                ));
+            }
+        }
+    }
+    let is_bin = output.extension().map(|e| e == "bin").unwrap_or(false);
+    if is_bin {
+        // Streaming: baca 8-byte record per chunk buffer, tulis per part —
+        // tanpa fs::read seluruh file ke RAM.
+        let meta = std::fs::metadata(output)?;
+        let total = (meta.len() / 8) as usize;
+        let per = total.div_ceil(n).max(1);
+        let f = std::fs::File::open(output)?;
+        let mut rin = BufReader::with_capacity(64 * 1024, f);
+        let mut buf = vec![0u8; 64 * 1024]; // 64KB kelipatan 8: tidak ada record terbelah
+        let mut parts: Vec<PathBuf> = Vec::new();
+        for i in 0..n {
+            let start_rec = i.saturating_mul(per);
+            if start_rec >= total {
+                break;
+            }
+            let take_rec = per.min(total - start_rec);
+            let p = part_path(i);
+            let fout = std::fs::File::create(&p)?;
+            let mut w = BufWriter::with_capacity(64 * 1024, fout);
+            let mut remaining = take_rec.saturating_mul(8);
+            while remaining > 0 {
+                let want = buf.len().min(remaining);
+                rin.read_exact(&mut buf[..want])?;
+                w.write_all(&buf[..want])?;
+                remaining -= want;
+            }
+            w.flush()?;
+            parts.push(p);
+        }
+        return Ok(parts);
+    }
     // Count data rows first (header excluded).
-    let total: usize = if output.extension().map(|e| e == "bin").unwrap_or(false) {
-        (std::fs::metadata(output)?.len() / 8) as usize
-    } else {
+    let total: usize = {
         let f = std::fs::File::open(output)?;
         let r = BufReader::with_capacity(64 * 1024, f);
         let mut c = 0usize;
@@ -1165,20 +1641,6 @@ fn split_output_by_count(output: &Path, n: usize, has_header: bool) -> std::io::
     };
     let per = total.div_ceil(n).max(1);
     let mut parts: Vec<PathBuf> = Vec::new();
-    if output.extension().map(|e| e == "bin").unwrap_or(false) {
-        let raw = std::fs::read(output)?;
-        for i in 0..n {
-            let s = (i * per * 8).min(raw.len());
-            let e = ((i + 1) * per * 8).min(raw.len());
-            if s >= e {
-                break;
-            }
-            let p = parent.join(format!("{}-{:03}{}", stem, i + 1, ext));
-            std::fs::write(&p, &raw[s..e])?;
-            parts.push(p);
-        }
-        return Ok(parts);
-    }
     let f = std::fs::File::open(output)?;
     let mut rin = BufReader::with_capacity(64 * 1024, f);
     let mut header_line: Vec<u8> = Vec::new();
@@ -1223,9 +1685,152 @@ fn split_output_by_count(output: &Path, n: usize, has_header: bool) -> std::io::
     Ok(parts)
 }
 
+/// Split output by size: tiap part maks `max_bytes` data (header diulang per part).
+/// Streaming, tanpa load penuh. Untuk .bin: potong per kelipatan 8 byte.
+fn split_output_by_size(output: &Path, max_bytes: u64, has_header: bool, force: bool) -> std::io::Result<Vec<PathBuf>> {
+    use std::io::{BufReader, BufWriter, Read, Write};
+    use std::io::BufRead;
+    let stem = output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "out".to_string());
+    let ext = output.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let parent = output.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    let is_bin = output.extension().map(|e| e == "bin").unwrap_or(false);
+    let mut parts: Vec<PathBuf> = Vec::new();
+    let mut idx = 0usize;
+    let new_part = |idx: usize| parent.join(format!("{}-{:03}{}", stem, idx + 1, ext));
+    if is_bin {
+        let f = std::fs::File::open(output)?;
+        let mut rin = BufReader::with_capacity(64 * 1024, f);
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut cur: Option<BufWriter<std::fs::File>> = None;
+        let mut cur_bytes = 0u64;
+        loop {
+            let n = rin.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            // Potong agar tidak belah record 8-byte antar part.
+            let mut off = 0usize;
+            while off < n {
+                if cur.is_none() {
+                    let p = new_part(idx);
+                    if !force && p.exists() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("file part sudah ada: {} (pakai --force untuk menimpa)", p.display()),
+                        ));
+                    }
+                    let fout = std::fs::File::create(&p)?;
+                    parts.push(p);
+                    cur = Some(BufWriter::with_capacity(64 * 1024, fout));
+                    cur_bytes = 0;
+                    idx += 1;
+                }
+                let room = max_bytes.saturating_sub(cur_bytes) as usize;
+                let take = if room == 0 {
+                    cur.as_mut().unwrap().flush()?;
+                    cur = None;
+                    continue;
+                } else {
+                    (room / 8 * 8).max(8).min(n - off)
+                };
+                cur.as_mut().unwrap().write_all(&buf[off..off + take])?;
+                cur_bytes += take as u64;
+                off += take;
+            }
+        }
+        if let Some(mut w) = cur.take() {
+            w.flush()?;
+        }
+        return Ok(parts);
+    }
+    let f = std::fs::File::open(output)?;
+    let mut rin = BufReader::with_capacity(64 * 1024, f);
+    let mut header_line: Vec<u8> = Vec::new();
+    if has_header {
+        rin.read_until(b'\n', &mut header_line)?;
+    }
+    let mut cur: Option<BufWriter<std::fs::File>> = None;
+    let mut cur_bytes = 0u64;
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        let r = rin.read_until(b'\n', &mut line)?;
+        if r == 0 {
+            break;
+        }
+        if cur.is_none() {
+            let p = new_part(idx);
+            if !force && p.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("file part sudah ada: {} (pakai --force untuk menimpa)", p.display()),
+                ));
+            }
+            let fout = std::fs::File::create(&p)?;
+            let mut w = BufWriter::with_capacity(64 * 1024, fout);
+            if has_header && !header_line.is_empty() {
+                w.write_all(&header_line)?;
+                cur_bytes = header_line.len() as u64;
+            } else {
+                cur_bytes = 0;
+            }
+            parts.push(p);
+            cur = Some(w);
+            idx += 1;
+        }
+        if cur_bytes + line.len() as u64 > max_bytes && cur_bytes > 0 {
+            cur.as_mut().unwrap().flush()?;
+            cur = None;
+            continue;
+        }
+        cur.as_mut().unwrap().write_all(&line)?;
+        cur_bytes += line.len() as u64;
+    }
+    if let Some(mut w) = cur.take() {
+        w.flush()?;
+    }
+    Ok(parts)
+}
+
 /// Compression + Excel filename helpers (Lapis-3: transparent .gz/.zip/.xlsx).
 fn ext_is(path: &Path, ext: &str) -> bool {
     path.extension().map(|e| e.to_string_lossy().to_lowercase() == ext).unwrap_or(false)
+}
+
+/// Temp path dekompresi/kompresi yang mempertahankan nama file:
+/// `<stem>.decompressed.tmp` / `<stem>.compressing.tmp` di folder yang sama.
+/// (with_extension("...") mengganti ekstensi terakhir sehingga nama ganda
+/// seperti `data.csv.gz` bisa kehilangan konteks ekstensi.)
+fn decompress_tmp_path(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "input".to_string());
+    input.with_file_name(format!("{}.decompressed.tmp", stem))
+}
+
+fn compress_tmp_path(output: &Path) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_string());
+    output.with_file_name(format!("{}.compressing.tmp", stem))
+}
+
+/// Ruang kosong (bytes) pada volume yang menaungi `path`; None bila tak terdeteksi.
+fn available_space_for(path: &Path) -> Option<u64> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut best: Option<(usize, u64)> = None;
+    for d in disks.list() {
+        if canon.starts_with(d.mount_point()) {
+            let score = d.mount_point().as_os_str().len();
+            if best.map(|(s, _)| score > s).unwrap_or(true) {
+                best = Some((score, d.available_space()));
+            }
+        }
+    }
+    best.map(|(_, a)| a)
 }
 
 /// Decompresses .gz/.zip input to a temp file (streaming). Returns
@@ -1237,8 +1842,19 @@ fn maybe_decompress_input(input: &Path) -> Result<(PathBuf, Option<PathBuf>), St
     }
     if ext_is(input, "gz") {
         let f = std::fs::File::open(input).map_err(|e| format!("buka {}: {}", input.display(), e))?;
+        let comp_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        // Cek free space SEBELUM gunzip penuh: hasil dekompresi >= file terkompresi.
+        if let Some(avail) = available_space_for(input)
+            && avail < comp_len {
+                return Err(format!(
+                    "ruang disk tidak cukup untuk dekompresi {} (butuh >= {}, sisa {}) — kosongkan disk atau set MERGESORT_TEMP_DIR ke drive lain",
+                    input.display(),
+                    inspect::human(comp_len),
+                    inspect::human(avail)
+                ));
+            }
         let mut dec = flate2::read::GzDecoder::new(BufReader::with_capacity(64 * 1024, f));
-        let tmp = input.with_extension("decompressed.tmp");
+        let tmp = decompress_tmp_path(input);
         let fout = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         let mut wout = BufWriter::with_capacity(64 * 1024, fout);
         std::io::copy(&mut dec, &mut wout).map_err(|e| format!("gunzip gagal: {}", e))?;
@@ -1251,21 +1867,33 @@ fn maybe_decompress_input(input: &Path) -> Result<(PathBuf, Option<PathBuf>), St
         if zip.is_empty() {
             return Err("zip kosong".to_string());
         }
-        if zip.len() > 1 {
-            eprintln!("peringatan: zip berisi {} file — hanya file pertama yang di-sort", zip.len());
+        // Daftar semua entry dulu (eprintln dipertahankan + nama file dicantumkan).
+        let mut names: Vec<String> = Vec::new();
+        for idx in 0..zip.len() {
+            let zf = zip.by_index(idx).map_err(|e| format!("extract zip gagal: {}", e))?;
+            names.push(zf.name().to_string());
         }
-        let mut zf = zip.by_index(0).map_err(|e| format!("extract zip gagal: {}", e))?;
-        let tmp = input.with_extension("decompressed.tmp");
+        if zip.len() > 1 {
+            eprintln!(
+                "peringatan: zip berisi {} file — semuanya digabungkan berurutan: {}",
+                zip.len(),
+                names.join(", ")
+            );
+        }
+        let tmp = decompress_tmp_path(input);
         let fout = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         let mut wout = BufWriter::with_capacity(64 * 1024, fout);
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n: usize = zf.read(&mut buf).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
+        for idx in 0..zip.len() {
+            let mut zf = zip.by_index(idx).map_err(|e| format!("extract zip gagal: {}", e))?;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n: usize = zf.read(&mut buf).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                use std::io::Write;
+                wout.write_all(&buf[..n]).map_err(|e| e.to_string())?;
             }
-            use std::io::Write;
-            wout.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         }
         drop(wout);
         return Ok((tmp.clone(), Some(tmp)));
@@ -1282,7 +1910,7 @@ fn maybe_compress_output(output: &Path) -> Result<(), String> {
     if ext_is(output, "gz") {
         let f = std::fs::File::open(output).map_err(|e| e.to_string())?;
         let mut rin = BufReader::with_capacity(64 * 1024, f);
-        let tmp = output.with_extension("compressing.tmp");
+        let tmp = compress_tmp_path(output);
         let fout = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         let wout = BufWriter::with_capacity(64 * 1024, fout);
         let mut enc = flate2::write::GzEncoder::new(wout, flate2::Compression::default());
@@ -1299,13 +1927,15 @@ fn maybe_compress_output(output: &Path) -> Result<(), String> {
         return Ok(());
     }
     if ext_is(output, "zip") {
-        let raw = std::fs::read(output).map_err(|e| e.to_string())?;
+        // Streaming: File -> ZipWriter tanpa fs::read seluruh output ke RAM.
+        let f = std::fs::File::open(output).map_err(|e| e.to_string())?;
+        let mut rin = BufReader::with_capacity(64 * 1024, f);
         let inner = output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "data".to_string());
-        let tmp = output.with_extension("compressing.tmp");
+        let tmp = compress_tmp_path(output);
         let fout = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         let mut zipw = zip::ZipWriter::new(fout);
         zipw.start_file(inner, zip::write::SimpleFileOptions::default()).map_err(|e| e.to_string())?;
-        zipw.write_all(&raw).map_err(|e| e.to_string())?;
+        std::io::copy(&mut rin, &mut zipw).map_err(|e| e.to_string())?;
         zipw.finish().map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, output).map_err(|e| e.to_string())?;
         return Ok(());
@@ -1315,8 +1945,19 @@ fn maybe_compress_output(output: &Path) -> Result<(), String> {
 
 /// Reads an .xlsx sheet into CSV bytes (RFC-4180 minimal: quote on demand).
 /// Empty cells become empty fields; dates/numbers use calamine display strings.
+///
+/// OOM guard: calamine menampung seluruh sheet + buffer CSV di RAM (bukan
+/// streaming), sehingga file >500MB ditolak dengan pesan "gunakan CSV"
+/// (konversi manual ke CSV lalu sort dengan --format csv, yang streaming).
 fn xlsx_sheet_to_csv(path: &Path, sheet_opt: Option<&str>) -> Result<Vec<u8>, String> {
     use calamine::{Reader, Xlsx};
+    const XLSX_MAX_BYTES: u64 = 500 * 1024 * 1024;
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > XLSX_MAX_BYTES {
+        return Err(format!(
+            "file xlsx >500MB ({}): risiko OOM — konversi dulu ke CSV lalu sort dengan --format csv",
+            inspect::human(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+        ));
+    }
     let mut wb: Xlsx<_> = calamine::open_workbook(path).map_err(|e| format!("buka xlsx gagal: {}", e))?;
     let names = wb.sheet_names();
     if names.is_empty() {
@@ -1353,8 +1994,15 @@ fn xlsx_sheet_to_csv(path: &Path, sheet_opt: Option<&str>) -> Result<Vec<u8>, St
 }
 
 /// Writes sorted CSV bytes to .xlsx (single sheet). Header row bolded.
+///
+/// OOM guard: workbook dirakit penuh di RAM (bukan streaming), sehingga CSV
+/// >500MB ditolak dengan pesan "gunakan CSV".
 fn csv_to_xlsx(csv: &[u8], path: &Path, sheet_name: &str) -> Result<(), String> {
     use rust_xlsxwriter::{Format, Workbook};
+    const CSV_MAX_BYTES: u64 = 500 * 1024 * 1024;
+    if csv.len() as u64 > CSV_MAX_BYTES {
+        return Err("csv >500MB: tulis output .xlsx dibatalkan (risiko OOM) — gunakan CSV".to_string());
+    }
     let text = String::from_utf8_lossy(csv);
     let mut wb = Workbook::new();
     let ws = wb.add_worksheet();
@@ -1424,7 +2072,7 @@ fn count_output_rows(path: &Path, is_numeric: bool, has_header: bool) -> usize {
     let r = BufReader::with_capacity(64 * 1024, f);
     let mut c = 0usize;
     let mut first = true;
-    for line in r.lines().flatten() {
+    for line in r.lines().map_while(Result::ok) {
         if has_header && first {
             first = false;
             continue;
@@ -1457,6 +2105,13 @@ fn run_merge_mode(cfg: &Config) {
     if matches!(cfg.fmt, SortFormat::Numeric) && cfg.header {
         errors::fail(errors::USAGE, "--merge numeric tidak memakai --header");
     }
+    // Safety: tidak ada merge input yang sama dengan output; tolak timpa tanpa --force.
+    for f in files {
+        if same_file(f, cfg.output.as_path()) {
+            errors::fail(errors::USAGE, &format!("--merge input sama dengan --output: {}", f.display()));
+        }
+    }
+    guard_output_overwrite(cfg.output.as_path(), cfg.force, cfg.backup);
     // Header bytes from first file (text modes + --header).
     let header_bytes: Option<Vec<u8>> = if cfg.header {
         match read_header_line(&files[0]) {
@@ -1515,11 +2170,12 @@ fn run_merge_mode(cfg: &Config) {
         cfg.dedupe_by.clone(),
         cfg.dedupe_keep_last,
         &skips,
+        sort_opts(cfg),
     );
     if let Err(e) = mres {
         bars.finish();
         let code = if e.kind() == std::io::ErrorKind::InvalidData { errors::DATA } else { errors::IO };
-        errors::fail(code, &format!("merge gagal: {}", errors::io_hint(&e)));
+        io_fail(code, "merge", &e);
     }
     if let Some(h) = header_bytes.as_ref()
         && let Err(e) = prepend_header_to_staged(staged.as_path(), h) {
@@ -1545,13 +2201,13 @@ fn run_merge_mode(cfg: &Config) {
     if cfg.do_verify && cfg.output_format.is_none() {
         let vres = match &cfg.fmt {
             SortFormat::Csv { delimiter, keys, key_numeric } => {
-                verify::verify_csv_full(cfg.output.as_path(), *delimiter, keys, *key_numeric, cfg.reverse, cfg.header)
+                verify::verify_csv_full(cfg.output.as_path(), *delimiter, keys, *key_numeric, cfg.reverse, cfg.header, &sort_opts(cfg))
             }
             SortFormat::Jsonl { field, key_numeric } => {
-                verify::verify_jsonl_full(cfg.output.as_path(), field, *key_numeric, cfg.reverse)
+                verify::verify_jsonl_full(cfg.output.as_path(), field, *key_numeric, cfg.reverse, &sort_opts(cfg))
             }
-            SortFormat::Numeric => verify::verify_full(cfg.output.as_path(), "numeric", cfg.reverse, false),
-            SortFormat::String => verify::verify_full(cfg.output.as_path(), "string", cfg.reverse, cfg.header),
+            SortFormat::Numeric => verify::verify_full(cfg.output.as_path(), "numeric", cfg.reverse, false, &sort_opts(cfg)),
+            SortFormat::String => verify::verify_full(cfg.output.as_path(), "string", cfg.reverse, cfg.header, &sort_opts(cfg)),
         };
         match vres {
             Ok(n) => verify_note = format!("OK ({} records)", n),
@@ -1562,7 +2218,7 @@ fn run_merge_mode(cfg: &Config) {
         }
     }
     if let Some(n) = cfg.split_by
-        && let Err(e) = split_output_by_count(cfg.output.as_path(), n, cfg.header) {
+        && let Err(e) = split_output_by_count(cfg.output.as_path(), n, cfg.header, cfg.force) {
             bars.finish();
             errors::fail(errors::IO, &format!("split-by gagal: {}", e));
         }
@@ -1808,17 +2464,14 @@ fn smart_dry_run(
         let tot: usize = sample.iter().take(200).map(|l| l.len() + 1).sum();
         let n = sample.iter().take(200).filter(|l| !l.is_empty()).count().max(1);
         let avg = (tot / n).max(1) as u64;
-        (if avg > 0 { input_len / avg } else { 1 }, avg)
+        (input_len.checked_div(avg).unwrap_or(1), avg)
     };
     let est_chunks = est_rows.div_ceil(capacity as u64).max(1);
-    // Temp estimate: factor by format (string/csv/jsonl rewrite overhead).
-    let factor: f64 = match fmt {
-        SortFormat::Numeric => 2.0,
-        SortFormat::String => 5.0,
-        SortFormat::Csv { .. } | SortFormat::Jsonl { .. } => 4.0,
-    };
-    let est_temp = (input_len as f64 * factor) as u64;
-    // Time estimate: heuristic throughput ~120MB/min single-thread-ish scaled.
+    // Estimasi temp disamakan dengan disk::estimate_need_bytes (satu sumber
+    // kebenaran dengan pre-flight check) — bukan faktor hardcode per format.
+    // Estimasi waktu: asumsi throughput SSD ~120MB/menit, skala sqrt(threads).
+    let est_temp = disk::estimate_need_bytes(input_len);
+    // Time estimate: heuristic throughput ~120MB/min (asumsi SSD) scaled.
     let mb = input_len as f64 / (1024.0 * 1024.0);
     let est_secs = (mb / 120.0 * 60.0 / (threads as f64).sqrt()).max(2.0);
     // Temp space check.
@@ -1858,10 +2511,10 @@ fn smart_dry_run(
             SortFormat::Csv { key_numeric, keys, .. } => (*key_numeric, keys.first().copied().unwrap_or(0)),
             _ => (false, 0),
         };
-        (Some(d), inspect::detect_header(&sample, key_num, key_col))
+        (Some(d), inspect::detect_header(&sample, key_num, key_col, d))
     } else if matches!(fmt, SortFormat::String) {
         let sample = inspect::read_sample_lines(input, enc_in, bom_len, 100);
-        (None, inspect::detect_header(&sample, false, 0))
+        (None, inspect::detect_header(&sample, false, 0, 0))
     } else {
         (None, false)
     };
@@ -1933,6 +2586,7 @@ fn smart_dry_run(
 /// Read first N + last N data lines from a sorted staged file (header-aware).
 /// Returns (head, tail, total_data_rows). Numeric binary unsupported for preview text.
 fn read_head_tail(staged: &Path, fmt: &SortFormat, n: usize, has_header: bool) -> std::io::Result<(Vec<String>, Vec<String>, usize)> {
+    use std::collections::VecDeque;
     use std::io::{BufRead, BufReader};
     if matches!(fmt, SortFormat::Numeric) {
         let meta = std::fs::metadata(staged)?;
@@ -1968,7 +2622,8 @@ fn read_head_tail(staged: &Path, fmt: &SortFormat, n: usize, has_header: bool) -
     let f = std::fs::File::open(staged)?;
     let r = BufReader::with_capacity(64 * 1024, f);
     let mut head: Vec<String> = Vec::new();
-    let mut ring: Vec<String> = Vec::with_capacity(n);
+    // Ring buffer O(1) amortisasi per baris (Vec + remove(0) akan O(N^2)).
+    let mut ring: VecDeque<String> = VecDeque::with_capacity(n);
     let mut total = 0usize;
     let mut first = true;
     for line in r.lines() {
@@ -1983,10 +2638,10 @@ fn read_head_tail(staged: &Path, fmt: &SortFormat, n: usize, has_header: bool) -
             head.push(l.clone());
         }
         if ring.len() < n {
-            ring.push(l);
+            ring.push_back(l);
         } else if n > 0 {
-            ring.remove(0);
-            ring.push(l);
+            ring.pop_front();
+            ring.push_back(l);
         }
     }
     // Tail never overlaps head: head = first min(n,total),
@@ -1996,7 +2651,7 @@ fn read_head_tail(staged: &Path, fmt: &SortFormat, n: usize, has_header: bool) -
     } else if total <= 2 * n {
         ring.into_iter().skip(2 * n - total).collect()
     } else {
-        ring
+        ring.into_iter().collect()
     };
     Ok((head, tail, total))
 }
@@ -2030,10 +2685,15 @@ fn print_preview_json(cfg: &Config, total: usize, head: &[String], tail: &[Strin
 
 fn truncate_preview(s: &str, n: usize) -> String {
     if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
+        return s.to_string();
     }
+    // Char-boundary safe: mundur ke batas char valid (jangan belah UTF-8,
+    // mis. emoji/CJK) agar tidak panic pada byte slice.
+    let mut end = n;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// Screenshot-able execution report (--stats / --stats-json).
@@ -2299,7 +2959,11 @@ fn main() {
                     }
                 }
                 if !cfg.header_explicit {
-                    let auto_h = inspect::detect_header(&sample, cur_num, cur_key_col);
+                    let cur_delim_now = match &cfg.fmt {
+                        SortFormat::Csv { delimiter, .. } => *delimiter,
+                        _ => cur_delim,
+                    };
+                    let auto_h = inspect::detect_header(&sample, cur_num, cur_key_col, cur_delim_now);
                     if auto_h && !cfg.header {
                         cfg.header = true;
                         if !cfg.quiet {
@@ -2314,6 +2978,12 @@ fn main() {
     // Output staging not needed for preview-without-output.
     let is_preview = cfg.preview.is_some() || cfg.preview_json;
     let has_real_output = !cfg.output.as_os_str().is_empty();
+    // Safety (bukan preview/dry-run/check): tolak --input == --output dan tolak timpa tanpa --force.
+    // --preview/--dry-run/--check tidak commit ke mana pun sehingga tidak perlu dijaga.
+    if has_real_output && !is_preview && !cfg.dry_run && !cfg.check {
+        guard_input_output(cfg.input.as_path(), cfg.output.as_path());
+        guard_output_overwrite(cfg.output.as_path(), cfg.force, cfg.backup);
+    }
     if has_real_output
         && let Err(msg) = stage_output_part(cfg.output.as_path()) {
             errors::fail(errors::PREFLIGHT, &msg);
@@ -2390,6 +3060,10 @@ fn main() {
     let mut resumed_chunks: usize = 0;
     let mut resume_offset: u64 = 0;
     let mut resumed_label = String::from("-");
+    // Resume-race lock handle: assigned on the resume path below and held
+    // until main exits so a second `--resume` of the same run fails fast
+    // instead of two writers corrupting one run dir.
+    let mut _run_lock: Option<std::fs::File> = None;
 
     match cfg.resume.clone() {
         Some(spec) => {
@@ -2498,20 +3172,76 @@ fn main() {
                     ),
                 );
             }
-            if m.capacity != 0 && m.capacity != capacity as u64 {
+            // Stored size must match the live input: same path but rewritten
+            // content (or a corrupt manifest that slipped past structural
+            // validation) would otherwise mis-split chunk boundaries.
+            if !m.validate_against_input(input_len) {
                 errors::fail(
                     errors::PREFLIGHT,
                     &format!(
-                        "run '{}' dibuat dengan --max-memory yang berbeda (chunk capacity {} vs {}); pakai nilai yang sama atau mulai run baru",
-                        m.run_id, m.capacity, capacity
+                        "run '{}' mencatat input {} bytes tetapi file input sekarang {} bytes; input berubah sejak run dibuat — mulai run baru",
+                        m.run_id, m.input_bytes, input_len
                     ),
                 );
+            }
+            // Validasi capacity longgar pada granularitas boundary chunk (bytes),
+            // bukan exact records: ganti --threads menggeser capacity beberapa
+            // persen (margin ~1MB/thread di chunk::chunk_capacity) tapi offset
+            // chunk eksplisit di manifest tetap valid, sehingga resume tidak
+            // boleh gagal karenanya. Hanya --max-memory yang benar-benar beda
+            // kelas (>2x footprint) yang ditolak.
+            if m.capacity != 0 {
+                let rec = chunk::elem_overhead(&cfg.fmt) as u64;
+                let old_need = m.capacity.saturating_mul(rec.max(1));
+                let new_need = (capacity as u64).saturating_mul(rec.max(1));
+                let (lo, hi) = if old_need <= new_need {
+                    (old_need, new_need)
+                } else {
+                    (new_need, old_need)
+                };
+                if lo == 0 || hi > lo.saturating_mul(2) {
+                    errors::fail(
+                        errors::PREFLIGHT,
+                        &format!(
+                            "run '{}' dibuat dengan --max-memory yang berbeda (chunk capacity {} vs {}); pakai nilai yang sama atau mulai run baru",
+                            m.run_id, m.capacity, capacity
+                        ),
+                    );
+                } else if m.capacity != capacity as u64 {
+                    eprintln!(
+                        "peringatan: resume dengan chunk capacity {} (run memakai {}); offset chunk eksplisit di manifest tetap dipakai",
+                        capacity, m.capacity
+                    );
+                }
             }
             resumed_chunks = m.chunks.len();
             resume_offset = m.resume_offset();
             resumed_label = m.run_id.clone();
             temp_manager::set_preserve(true);
             temp_manager::adopt_run_dir(dir.clone());
+            // Claim exclusive ownership: a second process resuming the same
+            // run would double-write chunks/manifest. AlreadyExists = live
+            // owner (or stale .lock — delete manually after confirming).
+            match manifest::acquire_run_lock(&dir) {
+                Ok(f) => _run_lock = Some(f),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    errors::fail(
+                        errors::PREFLIGHT,
+                        &format!(
+                            "run '{}' sedang dipakai proses lain (lock di {}); tunggu selesai atau hapus .lock bila pemiliknya sudah mati",
+                            m.run_id,
+                            dir.display()
+                        ),
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: tidak bisa mengunci run dir {} ({}); lanjut tanpa proteksi resume-race",
+                        dir.display(),
+                        e
+                    );
+                }
+            }
             run_dir = dir;
             manifest_opt = Some(m);
         }
@@ -2655,6 +3385,7 @@ fn main() {
         Some(&state),
         cfg.reverse,
         cfg.header,
+        sort_opts(&cfg),
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -2665,7 +3396,7 @@ fn main() {
                 temp_manager::cleanup_run_dir_tree(run_dir.as_path());
             }
             let code = if e.kind() == std::io::ErrorKind::InvalidData { errors::DATA } else { errors::IO };
-            errors::fail(code, &format!("fase split gagal: {}", errors::io_hint(&e)));
+            io_fail(code, "fase split", &e);
         }
     };
 
@@ -2695,6 +3426,7 @@ fn main() {
             cfg.unique,
             cfg.dedupe_by.clone(),
             cfg.dedupe_keep_last,
+            sort_opts(&cfg),
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -2703,7 +3435,7 @@ fn main() {
                     temp_manager::cleanup_run_dir_tree(run_dir.as_path());
                 }
                 let code = if e.kind() == std::io::ErrorKind::InvalidData { errors::DATA } else { errors::IO };
-                errors::fail(code, &format!("fase merge gagal: {}", errors::io_hint(&e)));
+                io_fail(code, "fase merge", &e);
             }
         }
     };
@@ -2779,9 +3511,9 @@ fn main() {
         bars.finish();
         errors::fail(errors::USAGE, "--encoding-out tidak berlaku untuk output .xlsx");
     }
-    if (output_is_xlsx || output_is_compressed) && cfg.split_by.is_some() {
+    if (output_is_xlsx || output_is_compressed) && (cfg.split_by.is_some() || cfg.split_by_size.is_some()) {
         bars.finish();
-        errors::fail(errors::USAGE, "--split-by tidak bisa digabung dengan output .xlsx/.gz/.zip");
+        errors::fail(errors::USAGE, "--split-by/--split-by-size tidak bisa digabung dengan output .xlsx/.gz/.zip");
     }
     let converting = cfg.output_format.is_some() || output_is_xlsx || output_is_compressed;
     let mut verify_ok: Option<bool> = None;
@@ -2795,13 +3527,13 @@ fn main() {
     if converting && cfg.do_verify {
         let vres = match &cfg.fmt {
             SortFormat::Csv { delimiter, keys, key_numeric } => {
-                verify::verify_csv_full(staged.as_path(), *delimiter, keys, *key_numeric, cfg.reverse, cfg.header)
+                verify::verify_csv_full(staged.as_path(), *delimiter, keys, *key_numeric, cfg.reverse, cfg.header, &sort_opts(&cfg))
             }
             SortFormat::Jsonl { field, key_numeric } => {
-                verify::verify_jsonl_full(staged.as_path(), field, *key_numeric, cfg.reverse)
+                verify::verify_jsonl_full(staged.as_path(), field, *key_numeric, cfg.reverse, &sort_opts(&cfg))
             }
-            SortFormat::Numeric => verify::verify_full(staged.as_path(), "numeric", cfg.reverse, false),
-            SortFormat::String => verify::verify_full(staged.as_path(), "string", cfg.reverse, cfg.header),
+            SortFormat::Numeric => verify::verify_full(staged.as_path(), "numeric", cfg.reverse, false, &sort_opts(&cfg)),
+            SortFormat::String => verify::verify_full(staged.as_path(), "string", cfg.reverse, cfg.header, &sort_opts(&cfg)),
         };
         match vres {
             Ok(n) => {
@@ -2864,13 +3596,13 @@ fn main() {
     if !converting && cfg.do_verify {
         let vres = match &cfg.fmt {
             SortFormat::Csv { delimiter, keys, key_numeric } => {
-                verify::verify_csv_full(cfg.output.as_path(), *delimiter, keys, *key_numeric, cfg.reverse, cfg.header)
+                verify::verify_csv_full(cfg.output.as_path(), *delimiter, keys, *key_numeric, cfg.reverse, cfg.header, &sort_opts(&cfg))
             }
             SortFormat::Jsonl { field, key_numeric } => {
-                verify::verify_jsonl_full(cfg.output.as_path(), field, *key_numeric, cfg.reverse)
+                verify::verify_jsonl_full(cfg.output.as_path(), field, *key_numeric, cfg.reverse, &sort_opts(&cfg))
             }
-            SortFormat::Numeric => verify::verify_full(cfg.output.as_path(), "numeric", cfg.reverse, false),
-            SortFormat::String => verify::verify_full(cfg.output.as_path(), "string", cfg.reverse, cfg.header),
+            SortFormat::Numeric => verify::verify_full(cfg.output.as_path(), "numeric", cfg.reverse, false, &sort_opts(&cfg)),
+            SortFormat::String => verify::verify_full(cfg.output.as_path(), "string", cfg.reverse, cfg.header, &sort_opts(&cfg)),
         };
         match vres {
             Ok(n) => {
@@ -2899,10 +3631,10 @@ fn main() {
         }
     }
 
-    // --split-by N: break final output into N equal files (header repeated).
+    // --split-by N / --split-by-size SIZE: break final output (header repeated).
     let mut split_note = String::new();
     if let Some(n) = cfg.split_by {
-        match split_output_by_count(cfg.output.as_path(), n, cfg.header) {
+        match split_output_by_count(cfg.output.as_path(), n, cfg.header, cfg.force) {
             Ok(files) => {
                 split_note = format!(" -> {} files (split-by-{})", files.len(), n);
                 if !cfg.quiet {
@@ -2914,6 +3646,22 @@ fn main() {
             Err(e) => {
                 bars.finish();
                 errors::fail(errors::IO, &format!("split-by gagal: {}", e));
+            }
+        }
+    }
+    if let Some(maxb) = cfg.split_by_size {
+        match split_output_by_size(cfg.output.as_path(), maxb, cfg.header, cfg.force) {
+            Ok(files) => {
+                split_note = format!(" -> {} files (split-by-size {})", files.len(), disk::human_size(maxb));
+                if !cfg.quiet {
+                    for f in &files {
+                        println!("Split: {}", f.display());
+                    }
+                }
+            }
+            Err(e) => {
+                bars.finish();
+                errors::fail(errors::IO, &format!("split-by-size gagal: {}", e));
             }
         }
     }
@@ -3078,6 +3826,20 @@ fn append_jsonl_log(path: &Path, j: &JsonSummary) {
     );
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
+    // Rotasi sederhana gratis: bila >10MB, geser .1..5 lalu mulai baru.
+    // Best-effort, tidak pernah gagalkan sort.
+    if let Ok(m) = std::fs::metadata(path)
+        && m.len() > 10 * 1024 * 1024 {
+            for i in (1..5).rev() {
+                let a = PathBuf::from(format!("{}.{}", path.display(), i));
+                let b = PathBuf::from(format!("{}.{}", path.display(), i + 1));
+                if a.exists() {
+                    let _ = std::fs::rename(&a, &b);
+                }
+            }
+            let b1 = PathBuf::from(format!("{}.1", path.display()));
+            let _ = std::fs::rename(path, &b1);
+    }
     match opts.open(path) {
         Ok(mut f) => {
             if let Err(e) = writeln!(f, "{}", line) {
@@ -3097,6 +3859,8 @@ fn json_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }

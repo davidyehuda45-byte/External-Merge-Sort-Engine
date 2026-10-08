@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- MergeSort Pro MSI roadmap (WiX v4, gratis). Build: `wix build MergeSort.wxs -o dist/MergeSortPro.msi` -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="MergeSort Pro" Version="2.0.1" Manufacturer="MergeSort" UpgradeCode="6043dcd1-9183-4bb2-bf76-a1e4673d4a2f">
+    <MajorUpgrade DowngradeErrorMessage="Versi lebih baru sudah terpasang." />
+    <Feature Id="Main">
+      <Component Id="Exe" Directory="INSTALLFOLDER" Bitness="always64">
+        <File Id="MergesortExe" Source="mergesort.exe" KeyPath="yes" />
+        <File Id="GenExe" Source="mergesort-gen.exe" />
+        <File Id="StartGui" Source="Start-GUI.bat" />
+        <File Id="Uninstall" Source="Uninstall.bat" />
+      </Component>
+    </Feature>
+  </Package>
+</Wix>

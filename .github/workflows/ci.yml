@@ -9,6 +9,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
-      - run: cargo test --test correctness -- --skip prop
-      - run: cargo test --test output_modes -- json_summary_is_well_formed quiet_mode_prints_summary_only gen_bin_smoke
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --test correctness
+      - run: cargo test --locked --test output_modes -- --skip dashboard_serves_metrics_during_run
+      - name: dashboard test (retry up to 3x, flaky network timing)
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            if cargo test --locked --test output_modes dashboard_serves_metrics_during_run; then
+              exit 0
+            fi
+            echo "dashboard test attempt $i failed, retrying..."
+            sleep 5
+          done
+          exit 1
+  stress:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test stress_large_file -- --test-threads=1

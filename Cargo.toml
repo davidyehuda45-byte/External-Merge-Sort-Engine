@@ -2,6 +2,7 @@
 name = "mergesort"
 version = "2.0.1"
 edition = "2024"
+rust-version = "1.88"
 description = "MergeSort Pro — high-performance external merge sort for files larger than RAM (numeric, string, CSV)"
 license = "MIT"
 keywords = ["sort", "external-sort", "big-data", "csv", "cli"]
@@ -27,3 +28,8 @@ rust_xlsxwriter = "0.90"
 
 [dev-dependencies]
 proptest = "1.11.0"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

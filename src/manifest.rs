@@ -115,6 +115,13 @@ impl Manifest {
     }
 
     /// Writes manifest.part then renames over manifest.json (atomic on same dir).
+    ///
+    /// Durability note: the file itself is fsynced before rename so a
+    /// completed-chunk record survives a crash. A directory fsync after rename
+    /// (durable rename entry) is best-effort below: on Linux/Unix the dir fd
+    /// is synced; on Windows std offers no stable dir-sync so we rely on the
+    /// file sync + atomic rename. See also [`acquire_run_lock`] for the
+    /// resume-race guard (two processes must not own one run dir).
     pub fn save_atomic(&self, run_dir: &Path) -> std::io::Result<()> {
         let part = run_dir.join(Path::new("manifest.part"));
         let final_path = run_dir.join(Path::new("manifest.json"));
@@ -124,7 +131,15 @@ impl Manifest {
             f.flush()?;
             f.sync_all().ok(); // best effort: durability of the completed-chunk record
         }
-        fs::rename(part, final_path)
+        fs::rename(part, final_path)?;
+        // Best-effort directory fsync so the rename itself is durable.
+        #[cfg(unix)]
+        {
+            if let Ok(d) = fs::File::open(run_dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
     }
 
     /// Parses a manifest; returns None if missing or unparseable.
@@ -273,7 +288,7 @@ fn json_str_array_field(txt: &str, key: &str) -> Option<Vec<String>> {
 }
 
 pub fn parse_manifest(txt: &str) -> Option<Manifest> {
-    Some(Manifest {
+    let m = Manifest {
         run_id: json_str_field(txt, "run_id")?,
         format: json_str_field(txt, "format")?,
         delimiter: json_str_field(txt, "delimiter").unwrap_or_default(),
@@ -288,7 +303,65 @@ pub fn parse_manifest(txt: &str) -> Option<Manifest> {
         finished: json_bool_field(txt, "finished").unwrap_or(false),
         chunks: json_str_array_field(txt, "chunks").unwrap_or_default(),
         chunk_offsets: json_num_array_field(txt, "chunk_offsets").unwrap_or_default(),
-    })
+    };
+    // Reject corrupt manifests instead of resuming from garbage boundaries:
+    // chunk/offset arrays must be parallel, offsets strictly increasing
+    // (monoton), and the resume frontier must not exceed the recorded input
+    // size. Callers (`load`, resume flow) treat None as "no resumable run".
+    if !m.validate() {
+        return None;
+    }
+    Some(m)
+}
+
+/// Resume-race guard: exclusively creates `run_dir/.lock` (`create_new`).
+/// Ok(file) means this process owns the run; Err(AlreadyExists) means another
+/// process (or a stale lock from a crashed owner — remove it manually after
+/// verifying no live owner) already claimed it. Call before adopting a run
+/// dir for `--resume`; the returned handle should be held for the run's
+/// lifetime (dropping closes but does not delete the lock).
+pub fn acquire_run_lock(run_dir: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(run_dir.join(Path::new(".lock")))
+}
+
+impl Manifest {
+    /// Structural validation: parallel chunk/offset arrays, strictly
+    /// increasing offsets bounded by `input_bytes`, non-empty identity.
+    pub fn validate(&self) -> bool {
+        if self.run_id.is_empty() || self.format.is_empty() {
+            return false;
+        }
+        if self.chunks.len() != self.chunk_offsets.len() {
+            return false;
+        }
+        let mut prev: Option<u64> = None;
+        for &off in &self.chunk_offsets {
+            // Monoton strictly increasing: equal/decreasing offsets mean a
+            // torn write or hand-edited manifest — never resume from it.
+            if let Some(p) = prev && off <= p {
+                return false;
+            }
+            prev = Some(off);
+            // The resume frontier can never lie past the recorded input size
+            // (when known). `input_bytes == 0` with completed chunks is
+            // likewise corrupt (empty input produces zero chunks).
+            if self.input_bytes == 0 || off > self.input_bytes {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Full validation against the live input file: structural [`validate`]
+    /// plus stored `input_bytes` matching the actual file size. A mismatch
+    /// means the input changed since the run started — resume would silently
+    /// mis-split, so the caller must reject it.
+    pub fn validate_against_input(&self, actual_input_bytes: u64) -> bool {
+        self.validate() && self.input_bytes == actual_input_bytes
+    }
 }
 
 /// Scans `<base>/.temp_sort/run-*` for resumable (unfinished, completed>0) runs.

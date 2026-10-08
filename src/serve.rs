@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+type HttpRequest = (String, String, HashMap<String, String>, Vec<u8>);
+
 fn jobs() -> &'static Mutex<HashMap<String, Job>> {
     static J: OnceLock<Mutex<HashMap<String, Job>>> = OnceLock::new();
     J.get_or_init(|| Mutex::new(HashMap::new()))
@@ -32,17 +34,190 @@ fn api_token_store() -> &'static Mutex<Option<String>> {
     T.get_or_init(|| Mutex::new(None))
 }
 
+// ---------- Keamanan: path jail, batas DoS, validasi ----------
+
+/// Batas DoS: maks entri jobs di memori + maks body JSON untuk /api/sort & /api/rerun.
+/// Upload file (/api/upload) tetap boleh sampai 512MB.
+const MAX_JOBS: usize = 200;
+const MAX_SORT_JSON_BYTES: usize = 64 * 1024 * 1024;
+const MAX_UPLOAD_BYTES: usize = 512 * 1024 * 1024;
+
+/// Roots yang diizinkan untuk baca/tulis file via HTTP.
+/// Terdiri dari: cwd, uploads/ di bawah cwd, dan temp-dir dashboard.
+/// Semua perbandingan memakai path canonical; canonicalize yang gagal = tolak.
+fn allowed_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        let canon = std::fs::canonicalize(&cwd).unwrap_or(cwd.clone());
+        roots.push(canon.clone());
+        let up = cwd.join("uploads");
+        match std::fs::canonicalize(&up) {
+            Ok(c) => roots.push(c),
+            Err(_) => roots.push(up),
+        }
+    }
+    let tmp = std::env::temp_dir().join("mergesort-gui");
+    match std::fs::canonicalize(&tmp) {
+        Ok(c) => roots.push(c),
+        Err(_) => roots.push(tmp),
+    }
+    roots
+}
+
+/// true jika `p` (file yang sudah ada) canonicalize dan berada di dalam allowed roots.
+fn is_path_allowed(p: &Path) -> bool {
+    let canon = match std::fs::canonicalize(p) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    allowed_roots().iter().any(|r| canon.starts_with(r))
+}
+
+/// true jika `p` (output, boleh belum ada) aman untuk ditulis:
+/// canonicalize ancestor terdekat yang ada harus di dalam allowed roots.
+fn is_output_allowed(p: &Path) -> bool {
+    // Langsung coba canonicalize penuh (file sudah ada).
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return allowed_roots().iter().any(|r| c.starts_with(r));
+    }
+    // Cari ancestor terdekat yang ada, lalu pastikan sisa path relatif aman.
+    let mut cur = p.parent();
+    while let Some(dir) = cur {
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(c) = std::fs::canonicalize(dir) {
+            if !allowed_roots().iter().any(|r| c.starts_with(r)) {
+                return false;
+            }
+            // Ancestor di dalam jail; pastikan komponen sisanya tidak memanjat keluar.
+            let rest = p.strip_prefix(dir).unwrap_or(p);
+            for comp in rest.components() {
+                if matches!(comp, std::path::Component::ParentDir) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        cur = dir.parent();
+    }
+    // Path relatif tanpa ancestor yang ada: anggap relatif thd cwd (jail).
+    if p.is_relative() {
+        for comp in p.components() {
+            if matches!(comp, std::path::Component::ParentDir) {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Tolak path sistem absolut yang jelas berbahaya.
+fn is_system_path(p: &str) -> bool {
+    let l = p.to_lowercase().replace('/', "\\");
+    l.starts_with("c:\\windows") || l == "c:\\windows" || l.starts_with("/etc") || p.starts_with("/etc")
+}
+
+/// Validasi brand color: hanya #RGB / #RRGGBB heksadesimal.
+fn is_valid_brand_color(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 4 && b.len() != 7 {
+        return false;
+    }
+    if b[0] != b'#' {
+        return false;
+    }
+    b[1..].iter().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Sanitasi nama file untuk Content-Disposition: hapus \r \n " ; dan kontrol.
+fn sanitize_filename(name: &str) -> String {
+    let mut o = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '\r' | '\n' | '"' | ';' => o.push('_'),
+            c if (c as u32) < 0x20 => o.push('_'),
+            c => o.push(c),
+        }
+    }
+    if o.is_empty() { "download.dat".to_string() } else { o }
+}
+
+/// Validasi input/output POST /api/sort. Pesan Bahasa Indonesia, cocok untuk 400.
+fn validate_sort_paths(input: &str, output: &str) -> Result<(), String> {
+    if input.is_empty() || output.is_empty() {
+        return Err("input dan output wajib diisi".to_string());
+    }
+    if is_system_path(input) || is_system_path(output) {
+        return Err("path sistem (C:\\Windows, /etc) tidak diizinkan".to_string());
+    }
+    if !Path::new(input).is_file() {
+        return Err(format!("input tidak ditemukan: {}", input));
+    }
+    if !is_path_allowed(Path::new(input)) {
+        return Err("input di luar folder yang diizinkan (cwd/uploads/output-dir/temp-dir)".to_string());
+    }
+    if !is_output_allowed(Path::new(output)) {
+        return Err("output di luar folder yang diizinkan (cwd/uploads/output-dir)".to_string());
+    }
+    // Tolak input == output (bandingkan canonical jika keduanya ada).
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
+        if a == b {
+            return Err("input dan output tidak boleh sama".to_string());
+        }
+    } else if input == output {
+        return Err("input dan output tidak boleh sama".to_string());
+    }
+    Ok(())
+}
+
+/// Batas konkurensi sort: jumlah CPU atau 4 jika tidak terdeteksi.
+fn max_concurrent_sorts() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(1)
+}
+
+fn running_sort_count() -> usize {
+    jobs().lock().unwrap().values().filter(|j| j.status == "queued" || j.status == "running").count()
+}
+
+fn is_overload_error(e: &str) -> bool {
+    e.contains("terlalu banyak job")
+}
+
+/// Job id tak terduga: pid + nanos + counter + acak SystemTime, format job-<unix>-<hex>.
+fn new_job_id(n: u64) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let pid = std::process::id();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    // Acak tambahan dari waktu hash (tanpa dependency baru).
+    let mut h = DefaultHasher::new();
+    pid.hash(&mut h);
+    nanos.hash(&mut h);
+    n.hash(&mut h);
+    SystemTime::now().hash(&mut h);
+    // xorshift pengacak ringan di atas hash waktu.
+    let mut x = h.finish();
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x2545F4914F6CDD1D);
+    format!("job-{}-{:x}", now_unix(), x ^ (n.wrapping_mul(0x9E3779B97F4A7C15)))
+}
+
 #[derive(Clone, Debug)]
 struct Job {
     id: String,
     input: String,
     output: String,
-    status: String, // queued|running|done|error
+    status: String, // queued|running|done|error|cancelled
     detail: String, // summary or error tail
     started: u64,
     finished: u64,
     params: String,   // raw /api/sort JSON (for re-run + history)
     duration_s: u64,
+    cancelled: bool,
 }
 
 fn history_path() -> PathBuf {
@@ -65,10 +240,29 @@ fn append_history(entry: &str) {
         let t = txt.trim();
         if t.starts_with('[') && t.ends_with(']') {
             let inner = &t[1..t.len() - 1];
-            // Split top-level objects naively (entries are flat, no nested arrays).
+            // Split objek top-level dengan sadar string/escape: brace di dalam
+            // "..." (termasuk \" dan \\) tidak mengubah depth.
             let mut depth = 0i32;
             let mut cur = String::new();
+            let mut in_str = false;
+            let mut esc = false;
             for c in inner.chars() {
+                if in_str {
+                    cur.push(c);
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        in_str = false;
+                    }
+                    continue;
+                }
+                if c == '"' {
+                    in_str = true;
+                    cur.push(c);
+                    continue;
+                }
                 if c == '{' {
                     depth += 1;
                 }
@@ -167,11 +361,22 @@ fn jstr(body: &str, key: &str) -> Option<String> {
 }
 
 pub fn run_gui(bind: &str, port: u16, brand_name: Option<String>, brand_color: Option<String>) -> std::io::Result<()> {
+    let color = brand_color.unwrap_or_default();
+    let color = if color.is_empty() || is_valid_brand_color(&color) {
+        color
+    } else {
+        eprintln!("brand-color ditolak: harus hex #RGB/#RRGGBB, diabaikan");
+        String::new()
+    };
     *brand().lock().unwrap() = (
         brand_name.unwrap_or_default(),
-        brand_color.unwrap_or_default(),
+        color,
     );
     *api_token_store().lock().unwrap() = None;
+    // PERINGATAN KERAS: tanpa --api-token, siapa pun yang bisa mencapai port ini
+    // bisa antre sort / unduh file dalam jail. Tetap izinkan 127.0.0.1 untuk
+    // pemakaian lokal, tapi JANGAN bind 0.0.0.0 tanpa token di mesin bersama.
+    eprintln!("PERINGATAN: GUI tanpa api-token — hanya aman di 127.0.0.1. Jangan expose ke jaringan!");
     let listener = TcpListener::bind((bind, port))?;
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     eprintln!("MergeSort Pro console: http://{}:{}/", bind, bound);
@@ -199,6 +404,10 @@ pub fn run_api(bind: &str, port: u16, token: Option<String>) -> std::io::Result<
         eprintln!("API token: enabled (send Authorization: Bearer <token> or ?token=)");
     } else {
         eprintln!("API token: none — bind 127.0.0.1 only!");
+        // PERINGATAN KERAS: tanpa --api-token, endpoint mutasi (/api/sort,
+        // /api/upload, /api/gen, /api/inspect, /download) hanya aman bila
+        // didengar di 127.0.0.1. Tetap izinkan localhost, tolak expose publik.
+        eprintln!("PERINGATAN: API tanpa --api-token — hanya aman di 127.0.0.1. Jangan bind 0.0.0.0 tanpa token!");
     }
     for conn in listener.incoming() {
         match conn {
@@ -254,12 +463,17 @@ fn send_text(stream: &mut TcpStream, code: u16, msg: &str, body: &str) {
     let _ = stream.flush();
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<(String, String, HashMap<String, String>, Vec<u8>)> {
+fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let start = std::time::Instant::now();
+    // Batas total baca: 60s header + 120s total agar koneksi lambat tidak gantung.
     let mut head_buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 4096];
     // Read until end of headers.
     loop {
+        if start.elapsed() > Duration::from_secs(60) {
+            return None;
+        }
         match stream.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
@@ -293,16 +507,20 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, HashMap<Strin
         body.extend_from_slice(&head_buf[hlen..]);
     }
     // Uploads can be large: cap single-request body at 512MB to avoid OOM.
-    if cl > 512 * 1024 * 1024 {
+    // (/api/sort & /api/rerun JSON dibatasi lagi ke 64MB di handler.)
+    if cl > MAX_UPLOAD_BYTES {
         return None;
     }
     while body.len() < cl {
+        if start.elapsed() > Duration::from_secs(120) {
+            return None;
+        }
         match stream.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => body.extend_from_slice(&tmp[..n]),
             Err(_) => break,
         }
-        if body.len() > 512 * 1024 * 1024 {
+        if body.len() > MAX_UPLOAD_BYTES {
             break;
         }
     }
@@ -363,6 +581,22 @@ fn gui_html() -> String {
     html
 }
 
+/// Baca maksimal 50 baris dari 64KB pertama file (tanpa fs::read penuh).
+fn read_sample_lines_limited(path: &Path, enc: &crate::inspect::TextEncoding, bom_len: usize, max_lines: usize) -> Vec<String> {
+    use std::io::Read;
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut buf = Vec::new();
+    if f.take(64 * 1024).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let slice = if bom_len < buf.len() { &buf[bom_len..] } else { &[][..] };
+    let text = crate::inspect::decode_to_utf8(slice, enc);
+    text.lines().take(max_lines).map(|l| l.to_string()).collect()
+}
+
 /// Best-effort sniff of a server-side path for the GUI's "simple mode":
 /// guesses format (csv/jsonl/string), delimiter, header, and — for csv —
 /// real column names (or "Kolom N" + a sample value) so a non-technical
@@ -372,9 +606,14 @@ fn inspect_path_json(path: String) -> String {
     if path.is_empty() || !Path::new(&path).is_file() {
         return empty.to_string();
     }
+    // Path jail: tolak file di luar allowed roots.
+    if !is_path_allowed(Path::new(&path)) {
+        return empty.to_string();
+    }
     let p = Path::new(&path);
     let (enc, bom_len) = crate::inspect::sniff_bom(p);
-    let sample = crate::inspect::read_sample_lines(p, &enc, bom_len, 50);
+    // Batasi inspect ke 64KB pertama (File+take) agar file TB tidak dibaca penuh.
+    let sample = read_sample_lines_limited(p, &enc, bom_len, 50);
     let first_nonempty = sample.iter().find(|l| !l.trim().is_empty()).cloned().unwrap_or_default();
     if first_nonempty.trim().starts_with('{') && first_nonempty.trim().ends_with('}') {
         return "{\"format\":\"jsonl\",\"delimiter\":\",\",\"header\":false,\"columns\":[]}".to_string();
@@ -384,7 +623,7 @@ fn inspect_path_json(path: String) -> String {
     }
     let (delim, cols) = crate::inspect::detect_delimiter(&sample);
     let is_csv = cols > 1;
-    let header = is_csv && crate::inspect::detect_header(&sample, false, 0);
+    let header = is_csv && crate::inspect::detect_header(&sample, false, 0, delim);
     let mut columns_json = String::new();
     if is_csv {
         let ch = delim as char;
@@ -417,11 +656,10 @@ fn inspect_path_json(path: String) -> String {
 fn queue_sort_from_json(body_s: &str) -> Result<String, String> {
     let input = jstr(body_s, "input").unwrap_or_default();
     let output = jstr(body_s, "output").unwrap_or_default();
-    if input.is_empty() || output.is_empty() {
-        return Err("input and output paths are required".to_string());
-    }
-    if !Path::new(&input).is_file() {
-        return Err(format!("input not found: {}", input));
+    validate_sort_paths(&input, &output)?;
+    // DoS: batasi sort konkuren (queued+running) ke jumlah CPU / 4.
+    if running_sort_count() >= max_concurrent_sorts() {
+        return Err("server sibuk: terlalu banyak job berjalan bersamaan, coba lagi nanti".to_string());
     }
     let max_memory = jstr(body_s, "max_memory").unwrap_or_else(|| "512MB".to_string());
     let mode = jstr(body_s, "mode").unwrap_or_else(|| "string".to_string());
@@ -434,9 +672,23 @@ fn queue_sort_from_json(body_s: &str) -> Result<String, String> {
     let key_field = jstr(body_s, "key_field").unwrap_or_default();
     let mut n = counter().lock().unwrap();
     *n += 1;
-    let id = format!("job-{}-{}", now_unix(), *n);
+    let id = new_job_id(*n);
     drop(n);
-    jobs().lock().unwrap().insert(id.clone(), Job {
+    // DoS: batasi HashMap jobs maks 200; evict finished tertua dulu.
+    {
+        let mut map = jobs().lock().unwrap();
+        while map.len() >= MAX_JOBS {
+            let victim = map.values()
+                .filter(|j| j.status == "done" || j.status == "error")
+                .min_by_key(|j| j.finished)
+                .map(|j| j.id.clone())
+                .or_else(|| map.values().min_by_key(|j| j.started).map(|j| j.id.clone()));
+            match victim {
+                Some(v) => { map.remove(&v); }
+                None => break,
+            }
+        }
+        map.insert(id.clone(), Job {
         id: id.clone(),
         input: input.clone(),
         output: output.clone(),
@@ -446,7 +698,9 @@ fn queue_sort_from_json(body_s: &str) -> Result<String, String> {
         finished: 0,
         params: body_s.to_string(),
         duration_s: 0,
-    });
+        cancelled: false,
+        });
+    }
     let log_path = job_log_path(&id);
     let id2 = id.clone();
     std::thread::spawn(move || {
@@ -472,7 +726,7 @@ fn handle_conn(mut stream: TcpStream) {
             }
             let out = jobs().lock().unwrap().get(id).map(|j| j.output.clone());
             match out {
-                Some(p) if Path::new(&p).is_file() => return stream_file(&mut stream, Path::new(&p)),
+                Some(p) if Path::new(&p).is_file() && is_path_allowed(Path::new(&p)) => return stream_file(&mut stream, Path::new(&p)),
                 _ => {
                     send_text(&mut stream, 404, "Not Found", "{\"error\":\"result not ready or job unknown\"}");
                     return;
@@ -509,8 +763,58 @@ fn handle_conn(mut stream: TcpStream) {
             send(&mut stream, "application/json", b"{\"status\":\"ok\"}");
         }
         ("GET", "/api/inspect") => {
+            if !api_authorized(&target, &headers) {
+                send_text(&mut stream, 401, "Unauthorized", "{\"error\":\"api token required\"}");
+                return;
+            }
             let b = inspect_path_json(query_param(&target, "path").unwrap_or_default());
             send(&mut stream, "application/json", b.as_bytes());
+        }
+        ("GET", "/api/preview") => {
+            if !api_authorized(&target, &headers) {
+                send_text(&mut stream, 401, "Unauthorized", "{\"error\":\"api token required\"}");
+                return;
+            }
+            let p = query_param(&target, "path").unwrap_or_default();
+            let n: usize = query_param(&target, "n").and_then(|v| v.parse().ok()).unwrap_or(20);
+            let b = preview_file_json(&p, n);
+            send(&mut stream, "application/json", b.as_bytes());
+        }
+        ("GET", "/api/files") => {
+            if !api_authorized(&target, &headers) {
+                send_text(&mut stream, 401, "Unauthorized", "{\"error\":\"api token required\"}");
+                return;
+            }
+            let d = query_param(&target, "dir").unwrap_or_else(|| ".".to_string());
+            let b = list_files_json(&d);
+            send(&mut stream, "application/json", b.as_bytes());
+        }
+        ("POST", "/api/cancel") => {
+            if !api_authorized(&target, &headers) {
+                send_text(&mut stream, 401, "Unauthorized", "{\"error\":\"api token required\"}");
+                return;
+            }
+            let body_s = String::from_utf8_lossy(&body).into_owned();
+            let id = jstr(&body_s, "id").or_else(|| query_param(&target, "id")).unwrap_or_default();
+            if id.is_empty() {
+                send_text(&mut stream, 400, "Bad Request", "{\"error\":\"id wajib diisi\"}");
+                return;
+            }
+            let mut map = jobs().lock().unwrap();
+            match map.get_mut(&id) {
+                Some(j) if j.status == "queued" || j.status == "running" => {
+                    j.cancelled = true;
+                    j.status = "cancelled".to_string();
+                    j.detail = "dibatalkan pengguna".to_string();
+                    let b = format!("{{\"id\":\"{}\",\"status\":\"cancelled\"}}", json_escape(&id));
+                    send(&mut stream, "application/json", b.as_bytes());
+                }
+                Some(j) => {
+                    let b = format!("{{\"id\":\"{}\",\"status\":\"{}\"}}", json_escape(&id), json_escape(&j.status));
+                    send(&mut stream, "application/json", b.as_bytes());
+                }
+                None => send_text(&mut stream, 404, "Not Found", "{\"error\":\"job tidak ditemukan\"}"),
+            }
         }
         ("GET", "/api/history") => {
             let txt = std::fs::read_to_string(history_path()).unwrap_or_else(|_| "[]".to_string());
@@ -527,6 +831,12 @@ fn handle_conn(mut stream: TcpStream) {
         ("POST", "/api/rerun") => {
             if !api_authorized(&target, &headers) {
                 send_text(&mut stream, 401, "Unauthorized", "{\"error\":\"api token required\"}");
+                return;
+            }
+            // DoS: body JSON rerun maks 64MB (upload tetap 512MB).
+            let cl: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(body.len());
+            if cl > MAX_SORT_JSON_BYTES || body.len() > MAX_SORT_JSON_BYTES {
+                send_text(&mut stream, 413, "Payload Too Large", "{\"error\":\"body rerun maks 64MB\"}");
                 return;
             }
             let body_s = String::from_utf8_lossy(&body).into_owned();
@@ -550,6 +860,7 @@ fn handle_conn(mut stream: TcpStream) {
                             let b = format!("{{\"id\":\"{}\",\"status\":\"queued\",\"reran\":\"{}\"}}", json_escape(&id), json_escape(&hid));
                             send(&mut stream, "application/json", b.as_bytes());
                         }
+                        Err(e) if is_overload_error(&e) => send_text(&mut stream, 429, "Too Many Requests", &format!("{{\"error\":\"{}\"}}", json_escape(&e))),
                         Err(e) => send_text(&mut stream, 400, "Bad Request", &format!("{{\"error\":\"{}\"}}", json_escape(&e))),
                     },
                     _ => send_text(&mut stream, 404, "Not Found", "{\"error\":\"job id unknown (history keeps last 100)\"}"),
@@ -560,6 +871,7 @@ fn handle_conn(mut stream: TcpStream) {
                         let b = format!("{{\"id\":\"{}\",\"status\":\"queued\"}}", json_escape(&id));
                         send(&mut stream, "application/json", b.as_bytes());
                     }
+                    Err(e) if is_overload_error(&e) => send_text(&mut stream, 429, "Too Many Requests", &format!("{{\"error\":\"{}\"}}", json_escape(&e))),
                     Err(e) => send_text(&mut stream, 400, "Bad Request", &format!("{{\"error\":\"{}\"}}", json_escape(&e))),
                 }
             }
@@ -617,12 +929,19 @@ fn handle_conn(mut stream: TcpStream) {
                 send_text(&mut stream, 401, "Unauthorized", "{\"error\":\"api token required\"}");
                 return;
             }
+            // DoS: body JSON sort maks 64MB (upload tetap 512MB).
+            let cl: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(body.len());
+            if cl > MAX_SORT_JSON_BYTES || body.len() > MAX_SORT_JSON_BYTES {
+                send_text(&mut stream, 413, "Payload Too Large", "{\"error\":\"body sort maks 64MB\"}");
+                return;
+            }
             let body_s = String::from_utf8_lossy(&body).into_owned();
             match queue_sort_from_json(&body_s) {
                 Ok(id) => {
                     let b = format!("{{\"id\":\"{}\",\"status\":\"queued\"}}", json_escape(&id));
                     send(&mut stream, "application/json", b.as_bytes());
                 }
+                Err(e) if is_overload_error(&e) => send_text(&mut stream, 429, "Too Many Requests", &format!("{{\"error\":\"{}\"}}", json_escape(&e))),
                 Err(e) => send_text(&mut stream, 400, "Bad Request", &format!("{{\"error\":\"{}\"}}", json_escape(&e))),
             }
         }
@@ -650,6 +969,10 @@ fn handle_conn(mut stream: TcpStream) {
             }
         }
         ("GET", "/api/gen") => {
+            if !api_authorized(&target, &headers) {
+                send_text(&mut stream, 401, "Unauthorized", "{\"error\":\"api token required\"}");
+                return;
+            }
             // Demo data generator for sales demos (no CLI needed).
             let rows: usize = query_param(&target, "rows").and_then(|v| v.parse().ok()).unwrap_or(10_000);
             let mode = query_param(&target, "mode").unwrap_or_else(|| "string".to_string());
@@ -682,6 +1005,11 @@ fn handle_conn(mut stream: TcpStream) {
                 send_text(&mut stream, 404, "Not Found", "{\"error\":\"file not found\"}");
                 return;
             }
+            // Path jail: canonicalize dan tolak jika di luar allowed roots.
+            if !is_path_allowed(&pb) {
+                send_text(&mut stream, 403, "Forbidden", "{\"error\":\"path di luar folder yang diizinkan\"}");
+                return;
+            }
             stream_file(&mut stream, &pb);
         }
         _ => send_text(&mut stream, 404, "Not Found", "{\"error\":\"unknown route. Try GET /\"}"),
@@ -697,10 +1025,11 @@ fn stream_file(stream: &mut TcpStream, pb: &Path) {
         }
     };
     let fname = pb.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "download.dat".to_string());
+    let fname = sanitize_filename(&fname);
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
         meta.len(),
-        fname.replace('"', "_")
+        fname
     );
     if stream.write_all(head.as_bytes()).is_err() {
         return;
@@ -778,6 +1107,88 @@ fn job_log_tail(id: &str, max: usize) -> String {
     format!("...[truncated]...\n{}", String::from_utf8_lossy(&data[data.len() - max..]))
 }
 
+fn is_cancelled(id: &str) -> bool {
+    jobs().lock().unwrap().get(id).is_some_and(|j| j.cancelled)
+}
+
+/// Preview head/tail streaming max 64KB, tanpa fs::read penuh.
+fn preview_file_json(path: &str, n: usize) -> String {
+    let n = n.clamp(1, 100);
+    let pb = PathBuf::from(path);
+    if !pb.is_file() || !is_path_allowed(&pb) {
+        return "{\"error\":\"file tidak ditemukan / di luar izin\"}".to_string();
+    }
+    let f = match std::fs::File::open(&pb) {
+        Ok(f) => f,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", json_escape(&e.to_string())),
+    };
+    use std::io::{BufRead, BufReader};
+    let mut reader = BufReader::with_capacity(64 * 1024, f.take(64 * 1024));
+    let mut head: Vec<String> = Vec::new();
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut total = 0usize;
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = buf.trim_end_matches(['\r', '\n']).to_string();
+                if head.len() < n {
+                    head.push(line.clone());
+                }
+                tail.push_back(line);
+                if tail.len() > n {
+                    tail.pop_front();
+                }
+                total += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    let esc = |v: &[String]| v.iter().map(|s| format!("\"{}\"", json_escape(s))).collect::<Vec<_>>().join(",");
+    format!(
+        "{{\"path\":\"{}\",\"total_sample\":{},\"head\":[{}],\"tail\":[{}]}}",
+        json_escape(path),
+        total,
+        esc(&head),
+        esc(&tail.into_iter().collect::<Vec<_>>())
+    )
+}
+
+/// List file di allowed roots saja (untuk file picker GUI).
+fn list_files_json(dir: &str) -> String {
+    let base = if dir.is_empty() { ".".to_string() } else { dir.to_string() };
+    let pb = PathBuf::from(&base);
+    // Tolak .. dan absolut sistem; harus di dalam jail.
+    if is_system_path(&base) {
+        return "{\"error\":\"path sistem tidak diizinkan\"}".to_string();
+    }
+    let canon_ok = std::fs::canonicalize(&pb).map(|c| allowed_roots().iter().any(|r| c.starts_with(r))).unwrap_or(false);
+    if !canon_ok && !(pb.is_relative() && !base.contains("..")) {
+        return "{\"error\":\"dir di luar folder yang diizinkan\"}".to_string();
+    }
+    let rd = match std::fs::read_dir(&pb) {
+        Ok(r) => r,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", json_escape(&e.to_string())),
+    };
+    let mut items: Vec<String> = Vec::new();
+    for e in rd.flatten().take(200) {
+        let p = e.path();
+        let md = e.metadata().ok();
+        let is_dir = md.as_ref().is_some_and(|m| m.is_dir());
+        let bytes = md.map(|m| m.len()).unwrap_or(0);
+        items.push(format!(
+            "{{\"name\":\"{}\",\"path\":\"{}\",\"is_dir\":{},\"bytes\":{}}}",
+            json_escape(&e.file_name().to_string_lossy()),
+            json_escape(&p.display().to_string()),
+            is_dir,
+            bytes
+        ));
+    }
+    format!("{{\"dir\":\"{}\",\"files\":[{}]}}", json_escape(&base), items.join(","))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_sort_job(id: String, log_path: PathBuf, input: String, output: String, max_memory: String, mode: String, key_column: String, key_type: String, reverse: bool, unique: bool, header: bool, verify: bool, limit: String, key_field: String) {
     {
@@ -826,12 +1237,64 @@ fn run_sort_job(id: String, log_path: PathBuf, input: String, output: String, ma
         cmd.arg("--limit").arg(&limit);
     }
     cmd.arg("--json");
-    let out = cmd.output();
+    // Batal sebelum spawn: hormati permintaan cancel yang datang saat queued.
+    if is_cancelled(&id) {
+        let mut map = jobs().lock().unwrap();
+        if let Some(j) = map.get_mut(&id) {
+            j.status = "cancelled".to_string();
+            j.detail = "dibatalkan pengguna".to_string();
+            j.finished = now_unix();
+            j.duration_s = now_unix().saturating_sub(t_start);
+        }
+        return;
+    }
+    let mut child = match cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::write(&log_path, e.to_string());
+            let mut map = jobs().lock().unwrap();
+            if let Some(j) = map.get_mut(&id) {
+                j.status = "error".to_string();
+                j.detail = e.to_string().chars().take(500).collect();
+                j.finished = now_unix();
+                j.duration_s = now_unix().saturating_sub(t_start);
+            }
+            return;
+        }
+    };
+    // Polling: cek cancel tiap 200ms, kill child bila diminta.
+    let mut was_cancel = false;
+    let out = loop {
+        if is_cancelled(&id) {
+            let _ = child.kill();
+            let _ = child.wait();
+            was_cancel = true;
+            break None;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Proses selesai; ambil sisa stdout/stderr.
+                let mut so = Vec::new();
+                let mut se = Vec::new();
+                if let Some(mut o) = child.stdout.take() {
+                    use std::io::Read as _;
+                    let _ = o.read_to_end(&mut so);
+                }
+                if let Some(mut e) = child.stderr.take() {
+                    use std::io::Read as _;
+                    let _ = e.read_to_end(&mut se);
+                }
+                break Some((status, so, se));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => break None,
+        }
+    };
     let (ok, tail) = match out {
-        Ok(o) => {
-            let combined = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        Some((status, so, se)) => {
+            let combined = format!("{}{}", String::from_utf8_lossy(&so), String::from_utf8_lossy(&se));
             let _ = std::fs::write(&log_path, &combined);
-            let detail = if o.status.success() {
+            let detail = if status.success() {
                 // --json prints a pretty multi-line object; the last line is
                 // just "}" so pull the fields that matter instead.
                 let records = jstr(&combined, "records").unwrap_or_else(|| "?".to_string());
@@ -842,11 +1305,12 @@ fn run_sort_job(id: String, log_path: PathBuf, input: String, output: String, ma
             } else {
                 combined.lines().last().unwrap_or("").to_string()
             };
-            (o.status.success(), detail)
+            (status.success(), detail)
         }
-        Err(e) => {
-            let _ = std::fs::write(&log_path, e.to_string());
-            (false, e.to_string())
+        None => {
+            let msg = "dibatalkan pengguna".to_string();
+            let _ = std::fs::write(&log_path, &msg);
+            (false, msg)
         }
     };
     let dur = now_unix().saturating_sub(t_start);
@@ -856,7 +1320,10 @@ fn run_sort_job(id: String, log_path: PathBuf, input: String, output: String, ma
         if let Some(j) = map.get_mut(&id) {
             j.finished = now_unix();
             j.duration_s = dur;
-            if ok {
+            if was_cancel || j.cancelled {
+                j.status = "cancelled".to_string();
+                j.detail = "dibatalkan pengguna".to_string();
+            } else if ok {
                 j.status = "done".to_string();
                 j.detail = tail.chars().take(300).collect();
             } else {
@@ -958,7 +1425,7 @@ summary{cursor:pointer;color:var(--mut);font-size:13px;user-select:none}
 <div><label>Input path (server)</label><input id="input" placeholder="uploads/demo.txt atau C:\data\big.csv"></div>
 <div><label>Output path (server)</label><input id="output" placeholder="uploads/sorted.txt"></div>
 </div>
-<div class="row"><button class="ghost" onclick="genDemo()">Generate demo 10k</button><button class="ghost" onclick="genCsv()">Generate demo CSV</button><span class="mut" id="upmsg"></span></div>
+<div class="row"><button class="ghost" onclick="genDemo()">Generate demo 10k</button><button class="ghost" onclick="genCsv()">Generate demo CSV</button><button class="ghost" onclick="browseFiles()">Browse server</button><button class="ghost" onclick="previewPath(document.getElementById('input').value.trim())">Preview input</button><span class="mut" id="upmsg"></span></div>
 </div>
 <div class="card"><h2>2 · Cara mengurutkan</h2>
 <div id="detectedBadge" class="mut" style="display:none">Terdeteksi: <span id="detectedText" class="detected"></span></div>
@@ -1010,8 +1477,11 @@ summary{cursor:pointer;color:var(--mut);font-size:13px;user-select:none}
 <script>
 async function api(p,o){const r=await fetch(p,o);return r.json();}
 async function refreshStatus(){try{const s=await api('/api/status');document.getElementById('status').textContent='v'+s.version+' · '+s.jobs+' jobs';}catch(e){}}
-async function refresh(){try{const j=await api('/api/jobs');const tb=document.getElementById('jobs');tb.innerHTML='';(j.jobs||[]).slice().reverse().forEach(job=>{const tr=document.createElement('tr');tr.innerHTML='<td><code>'+job.id+'</code></td><td>'+job.input+' → '+job.output+'</td><td><span class="badge '+job.status+'">'+job.status+'</span></td><td>'+(job.detail||'').slice(0,120)+'</td>';const td=document.createElement('td');const b1=document.createElement('button');b1.className='ghost';b1.textContent='Log';b1.onclick=()=>showLog(job.id);const b2=document.createElement('button');b2.className='ghost';b2.textContent='Download';b2.onclick=()=>{window.location='/download?path='+encodeURIComponent(job.output);};td.appendChild(b1);td.appendChild(b2);tr.appendChild(td);tb.appendChild(tr);});}catch(e){}}
+async function refresh(){try{const j=await api('/api/jobs');const tb=document.getElementById('jobs');tb.innerHTML='';(j.jobs||[]).slice().reverse().forEach(job=>{const tr=document.createElement('tr');tr.innerHTML='<td><code>'+job.id+'</code></td><td>'+job.input+' → '+job.output+'</td><td><span class="badge '+job.status+'">'+job.status+'</span></td><td>'+(job.detail||'').slice(0,120)+'</td>';const td=document.createElement('td');const b1=document.createElement('button');b1.className='ghost';b1.textContent='Log';b1.onclick=()=>showLog(job.id);const b2=document.createElement('button');b2.className='ghost';b2.textContent='Download';b2.onclick=()=>{window.location='/download?path='+encodeURIComponent(job.output);};const b3=document.createElement('button');b3.className='ghost';b3.textContent='Cancel';b3.onclick=()=>cancelJob(job.id);if(job.status!=='queued'&&job.status!=='running'){b3.disabled=true;}const b4=document.createElement('button');b4.className='ghost';b4.textContent='Preview';b4.onclick=()=>previewPath(job.output||job.input);td.appendChild(b1);td.appendChild(b2);td.appendChild(b3);td.appendChild(b4);tr.appendChild(td);tb.appendChild(tr);});}catch(e){}}
 async function showLog(id){const j=await api('/api/job?id='+encodeURIComponent(id));document.getElementById('log').textContent=j.log||j.detail||'-';}
+async function cancelJob(id){if(!confirm('Batalkan '+id+'?'))return;await api('/api/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});refresh();}
+async function previewPath(p){if(!p){alert('path kosong');return;}const j=await api('/api/preview?path='+encodeURIComponent(p)+'&n=20');document.getElementById('log').textContent='PREVIEW '+p+'\nHEAD:\n'+(j.head||[]).join('\n')+'\n…\nTAIL:\n'+(j.tail||[]).join('\n');}
+async function browseFiles(){const d=prompt('Folder server (mis. uploads atau .):','.');if(d===null)return;const j=await api('/api/files?dir='+encodeURIComponent(d));document.getElementById('log').textContent=JSON.stringify(j,null,1);}
 function formState(){return{input:document.getElementById('input').value,output:document.getElementById('output').value,max_memory:document.getElementById('mem').value,mode:document.getElementById('mode').value,key_column:document.getElementById('keycolname').value,key_field:document.getElementById('keyfield').value,key_type:document.getElementById('keytype').value,limit:document.getElementById('limit').value,verify:document.getElementById('verify').value,reverse:document.getElementById('reverse').value,unique:document.getElementById('unique').checked?'true':'false',header:document.getElementById('header').value};}
 function applyState(s){if(!s)return;for(const[k,v]of Object.entries(s)){const el=document.getElementById({input:'input',output:'output',max_memory:'mem',mode:'mode',key_column:'keycolname',key_field:'keyfield',key_type:'keytype',limit:'limit',verify:'verify'}[k]||k);if(!el)continue;if(el.type==='checkbox'){el.checked=(v==='true');}else{el.value=v;}}onModeChange();}
 function getPresets(){try{return JSON.parse(localStorage.getItem('mergesort-presets')||'{}');}catch(e){return{};}}

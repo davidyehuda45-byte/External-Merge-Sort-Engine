@@ -1,8 +1,15 @@
 // Timing + memory metrics for the run summary.
+//
+// NOTE: the reported peak is this process's own RSS sampled via sysinfo.
+// It does NOT include child processes (e.g. decompressors/converters spawned
+// via std::process::Command) nor the OS page cache — treat it as a
+// lower bound on total machine pressure, not whole-pipeline usage.
 use std::time::Duration;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 /// Samples this process's RSS on a background thread; reports the peak.
+/// Dropping without `finish()` still stops the thread (see Drop impl) and
+/// discards the peak; call `finish()` to retrieve it.
 pub struct MemorySampler {
     handle: Option<std::thread::JoinHandle<()>>,
     stop: std::sync::mpsc::Sender<()>,
@@ -42,7 +49,22 @@ impl MemorySampler {
             let _ = self.stop.send(());
             let _ = h.join();
         }
+        // `handle` is None now so the Drop impl below becomes a no-op.
         self.result_rx.recv().unwrap_or(0) as usize
+    }
+}
+
+impl Drop for MemorySampler {
+    fn drop(&mut self) {
+        // Best-effort stop so a forgotten sampler never leaks its thread:
+        // signal exit, then join. `finish()` takes `self` and nulls `handle`,
+        // so this is a no-op after a normal finish. Never panics.
+        if self.handle.is_some() {
+            let _ = self.stop.send(());
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }
 

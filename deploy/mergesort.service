@@ -1,0 +1,14 @@
+[Unit]
+Description=MergeSort Pro watch daemon (auto-sort folder)
+After=network.target
+
+[Service]
+Type=simple
+# Ganti /opt/mergesort dan /data/inbox sesuai mesin Anda.
+ExecStart=/opt/mergesort/mergesort --watch /data/inbox --output-dir /data/sorted --max-memory 1GB --verify --log-file /var/log/mergesort/audit.jsonl
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

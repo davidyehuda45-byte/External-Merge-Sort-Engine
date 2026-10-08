@@ -132,7 +132,7 @@ fn dashboard_serves_metrics_during_run() {
     let mut last_body = String::new();
     for _ in 0..200 {
         if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-            let req = format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+            let req = "GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n".to_string();
             if stream.write_all(req.as_bytes()).is_ok() {
                 let mut buf = Vec::new();
                 let mut s = stream;
