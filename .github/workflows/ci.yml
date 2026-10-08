@@ -15,6 +15,7 @@ jobs:
       - run: cargo build --locked --release
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --test correctness
+      - run: cargo test --locked --test extended
       - run: cargo test --locked --test output_modes -- --skip dashboard_serves_metrics_during_run
       - name: dashboard test (retry up to 3x, flaky network timing)
         shell: bash

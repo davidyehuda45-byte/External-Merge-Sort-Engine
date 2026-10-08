@@ -315,7 +315,7 @@ proptest::proptest! {
         write_numeric(input.clone().as_path(), &v);
         let in_str = input.display().to_string();
         let out_str = output.display().to_string();
-        let r = run(&["--input", in_str.as_str(), "--output", out_str.as_str(), "--max-memory", "4MB"]);
+        let r = run(&["--input", in_str.as_str(), "--output", out_str.as_str(), "--max-memory", "4MB", "--force"]);
         assert!(r.status.success(), "run failed: {}", r.stderr);
         let got = read_numeric(output.clone().as_path());
         let mut want = v.clone();
@@ -332,7 +332,7 @@ proptest::proptest! {
         write_lines(input.clone().as_path(), refs.as_slice());
         let in_str = input.display().to_string();
         let out_str = output.display().to_string();
-        let r = run(&["--input", in_str.as_str(), "--output", out_str.as_str(), "--max-memory", "4MB", "--mode", "string"]);
+        let r = run(&["--input", in_str.as_str(), "--output", out_str.as_str(), "--max-memory", "4MB", "--mode", "string", "--force"]);
         assert!(r.status.success(), "run failed: {}", r.stderr);
         let got = read_lines(output.clone().as_path());
         let mut want = words.clone();
